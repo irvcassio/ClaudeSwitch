@@ -70,8 +70,8 @@ Before the first publish, on the machine that holds the site repo:
 2. Copy [`scripts/signing.env.example`](scripts/signing.env.example) to
    `scripts/signing.env` (gitignored) and fill in the signing identity, notary profile,
    and both key values.
-3. Bootstrap an empty, well-formed `appcast.xml` at `public/downloads/claudeswitch/` in
-   the site repo.
+3. Bootstrap an empty, well-formed `appcast.xml` at `downloads/claudeswitch/` in the
+   site repo — done, alongside the eight sibling product feeds.
 4. Verify `SUPublicEDKey` and `SUFeedURL` in the **installed** app, then set
    `CLAUDESWITCH_SPARKLE_READY=1` in `signing.env` to unlock `--publish`.
 

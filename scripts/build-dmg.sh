@@ -75,10 +75,14 @@ SITE_REPO="${SITE_REPO:-$HOME/doppoworks}"                   # checkout of the s
 FEED_DIR="${FEED_DIR:-claudeswitch}"                         # <FEED_PATH>/appcast.xml
 #
 # FEED_PATH is the path INSIDE the site repo, and is a variable rather than a
-# hardcoded "public/downloads/..." because sites differ in shape. Hardcoding one
-# is how an appcast lands somewhere the web server never looks while the publish
-# still reports success — which is exactly what happened to Doppo Console.
-FEED_PATH="${FEED_PATH:-public/downloads/${FEED_DIR}}"
+# hardcoded path because sites differ in shape. Hardcoding one is how an appcast
+# lands somewhere the web server never looks while the publish still reports
+# success — which is exactly what happened to Doppo Console.
+#
+# doppoworks serves the repo root (no public/ wrapper), so the eight sibling
+# feeds live at downloads/<product>/appcast.xml. Verified against the checkout,
+# not assumed.
+FEED_PATH="${FEED_PATH:-downloads/${FEED_DIR}}"
 FEED_URL="${FEED_URL:-https://www.doppoworks.com/downloads/${FEED_DIR}/appcast.xml}"
 
 # Beta is the default channel: a release that has not been through Beta has not
