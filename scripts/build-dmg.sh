@@ -85,6 +85,20 @@ FEED_DIR="${FEED_DIR:-claudeswitch}"                         # <FEED_PATH>/appca
 FEED_PATH="${FEED_PATH:-downloads/${FEED_DIR}}"
 FEED_URL="${FEED_URL:-https://www.doppoworks.com/downloads/${FEED_DIR}/appcast.xml}"
 
+# The human-facing download page, in the same site repo. Sparkle only reaches
+# people who ALREADY have the app; the beta page is how someone gets it the first
+# time. Without this step a release updates every existing install and the page
+# still offers the previous build — which is the state Doppo Console's beta
+# publishes are in today (only its *stable* publishes touch the page).
+#
+# ClaudeSwitch updates the page on BOTH channels, and says which channel the
+# linked build is in the link text. The audience of a noindex'd private-beta page
+# is testers; offering them a stale build to keep the page "stable-only" buys
+# nothing. BETA_PAGE_CARD is the <h3> text that identifies which card to rewrite.
+BETA_PAGE="${BETA_PAGE:-beta/index.html}"
+BETA_PAGE_CARD="${BETA_PAGE_CARD:-ClaudeSwitch}"
+BETA_PAGE_SOURCE_URL="${BETA_PAGE_SOURCE_URL:-https://github.com/irvcassio/ClaudeSwitch}"
+
 # Beta is the default channel: a release that has not been through Beta has not
 # been through anything.
 CHANNEL="${CHANNEL:-beta}"
@@ -578,9 +592,90 @@ grep -q "${ENCLOSURE_URL}" "$APPCAST" \
   || { echo "Appcast is missing the enclosure URL — not pushing." >&2; exit 1; }
 echo "    Appcast now advertises $(grep -c '<item>' "$APPCAST") item(s); newest is build ${BUILD_VERSION}."
 
-echo "11. Committing + pushing the feed (Vercel auto-deploys)..."
+# ── Point the download page at this build ───────────────────────────────────
+#
+# Two lines of the ClaudeSwitch card change per release: the bare DMG filename
+# inside <div class="code">, and the <div class="linkrow"> that carries the
+# release-asset URL and the version in its link text.
+#
+# The card itself is NOT generated. Its copy is editorial, and a script that
+# invents marketing prose on a publish run is a script that quietly rewords the
+# site. So a missing card is a loud warning, not a rewrite and not a failure:
+# the appcast is already committed at this point and every installed client
+# updates correctly without the page.
+PAGE_FILE="${SITE_REPO}/${BETA_PAGE}"
+PAGE_UPDATED=0
+echo "11. Pointing ${BETA_PAGE} at ${DMG_NAME}..."
+if [[ ! -f "$PAGE_FILE" ]]; then
+  echo "    WARNING: ${PAGE_FILE} does not exist — skipping the page update."
+elif ! grep -q "<h3>${BETA_PAGE_CARD}</h3>" "$PAGE_FILE"; then
+  echo "    WARNING: no '${BETA_PAGE_CARD}' card on ${BETA_PAGE} — skipping the page update."
+  echo "    The release is published and Sparkle will serve it; the page just won't"
+  echo "    offer it for a first-time download. Add a card once, then re-run:"
+  echo ""
+  echo "      <div class=\"card\">"
+  echo "        <span class=\"tag live\">Menu bar · app</span>"
+  echo "        <h3>${BETA_PAGE_CARD}</h3>"
+  echo "        <p>…what it is…</p>"
+  echo "        <div class=\"code\"><span class=\"c\"># requires macOS 15+</span>"
+  echo "${DMG_NAME}   <span class=\"c\"># Apple silicon</span></div>"
+  echo "        <div class=\"linkrow\"><a href=\"${ENCLOSURE_URL}\">Download ${MARKETING_VERSION} →</a></div>"
+  echo "      </div>"
+  echo ""
+  echo "    Only the DMG-filename line and the linkrow are rewritten on later runs."
+else
+  # Beta and stable are distinguishable in the link text, because a page that
+  # says "Download 1.0.2" without saying it is a beta is how a tester ends up
+  # reporting bugs against a build they think is the stable one.
+  LINK_LABEL="Download ${MARKETING_VERSION} →"
+  [[ "$CHANNEL" == "beta" ]] && LINK_LABEL="Download ${MARKETING_VERSION} (beta) →"
+
+  # Staged in a file for the same reason as the appcast item: awk -v mangles
+  # replacement text (& is the matched string in sub(), and a URL is exactly the
+  # kind of string you do not want half-expanded).
+  LINK_FILE=$(mktemp)
+  printf '      <div class="linkrow"><a href="%s">%s</a> · <a href="/buy">Licensing</a> · <a href="%s">Repository →</a></div>\n' \
+    "$ENCLOSURE_URL" "$LINK_LABEL" "$BETA_PAGE_SOURCE_URL" > "$LINK_FILE"
+
+  TMP_PAGE=$(mktemp)
+  awk -v card="$BETA_PAGE_CARD" -v dmg="$DMG_NAME" -v linkfile="$LINK_FILE" '
+    # Any card opener leaves the region; the matching <h3> enters it. The opener
+    # precedes its own <h3>, so entering is never cancelled by its own card.
+    /<div class="card">/                { in_card = 0 }
+    $0 ~ "<h3>" card "</h3>"            { in_card = 1 }
+    in_card && /^[A-Za-z0-9._-]+-arm64\.dmg/ {
+      sub(/^[A-Za-z0-9._-]+-arm64\.dmg/, dmg); print; next
+    }
+    in_card && /class="linkrow"/ && /releases\/download\// {
+      while ((getline line < linkfile) > 0) print line
+      in_card = 0; next
+    }
+    { print }
+  ' "$PAGE_FILE" > "$TMP_PAGE" && mv "$TMP_PAGE" "$PAGE_FILE"
+  rm -f "$LINK_FILE"
+
+  # A no-op rewrite is the failure mode worth catching: the markup drifts, both
+  # patterns miss, awk exits 0, and the page keeps advertising the old build
+  # while the script prints success. Both lines must now name THIS build.
+  PAGE_HITS=$(grep -c -- "${DMG_NAME}" "$PAGE_FILE" || true)
+  if [[ "$PAGE_HITS" -lt 2 ]] || ! grep -q -- "${RELEASE_TAG}/${DMG_NAME}" "$PAGE_FILE"; then
+    echo "Error: rewriting ${BETA_PAGE} did not update both lines of the ${BETA_PAGE_CARD} card." >&2
+    echo "  Expected the filename line and the linkrow href to name ${DMG_NAME}" >&2
+    echo "  (found ${PAGE_HITS} mention(s)). The card's markup has probably drifted" >&2
+    echo "  from what this script matches — fix the page by hand." >&2
+    echo "  The appcast is already written; re-running after the fix is safe." >&2
+    exit 1
+  fi
+  PAGE_UPDATED=1
+  echo "    ${BETA_PAGE}: ${BETA_PAGE_CARD} card now offers ${MARKETING_VERSION} (${CHANNEL})."
+fi
+
+echo "12. Committing + pushing the feed (Vercel auto-deploys)..."
 ( cd "$SITE_REPO"
   git add "${FEED_PATH}/appcast.xml"
+  # Same commit as the feed: the page and the appcast advertise the same build,
+  # so splitting them would give the site a window where they disagree.
+  [[ "$PAGE_UPDATED" == "1" ]] && git add "${BETA_PAGE}"
   git commit -m "release(claudeswitch): ${MARKETING_VERSION} b${BUILD_VERSION} (${CHANNEL})"
   git push )
 
@@ -589,7 +684,7 @@ echo "11. Committing + pushing the feed (Vercel auto-deploys)..."
 # appcast is the point of no return, and a VERSION bump for a release that never
 # went out would silently skip a version number. The edit is left uncommitted in
 # THIS repo — commit it alongside the release notes.
-echo "12. Recording ${MARKETING_VERSION} for channel ${CHANNEL} in ${VERSION_FILE}..."
+echo "13. Recording ${MARKETING_VERSION} for channel ${CHANNEL} in ${VERSION_FILE}..."
 CHANNEL_KEY=$(printf '%s' "$CHANNEL" | tr '[:lower:]' '[:upper:]')   # STABLE | BETA
 # Portable in-place edit (BSD sed needs the empty -i suffix); only the target
 # channel's line changes, so the other channel's recorded version is untouched.

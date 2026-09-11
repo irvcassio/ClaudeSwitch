@@ -62,6 +62,14 @@ nothing has been through Beta to promote.
 fetching the live feed and finding the new build in it. It refuses outright to publish an
 ad-hoc-signed, un-notarized, or unstapled artifact.
 
+It also repoints the ClaudeSwitch card on the site's `/beta` download page at the new
+build, in the same commit as the feed — Sparkle only reaches people who already have the
+app, so without that step a release updates every install while the page still hands
+first-timers the previous build. Both channels update the page and the link text says
+which (`Download 1.0.2 (beta) →`). Only two lines are rewritten, the DMG filename and the
+link row; the card's copy is never generated. If the card is missing the publish prints
+the markup to add and carries on — the release is still live and still auto-updates.
+
 Before the first publish, on the machine that holds the site repo:
 
 1. Generate ClaudeSwitch's **own** EdDSA keypair — `generate_keys --account claudeswitch`
