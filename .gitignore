@@ -1,5 +1,11 @@
 .build/
 build/
+# Suffixed .noindex so Spotlight does not index build output as a second
+# launchable copy of the app; build-dmg.sh writes here.
+build.noindex/
 .DS_Store
 *.xcuserstate
 .swiftpm/
+# Personal signing / notary credentials and the Sparkle private key path.
+# See scripts/signing.env.example.
+scripts/signing.env

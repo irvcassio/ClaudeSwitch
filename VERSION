@@ -1,0 +1,28 @@
+# ClaudeSwitch — the single source of truth for the VISIBLE version
+# (CFBundleShortVersionString) of each update channel.
+#
+# Sources/ClaudeSwitchCore/AppVersion.swift is a stamped mirror of whichever
+# line the build used; it decides nothing. The monotonic CFBundleVersion build
+# number is separate, lives in Info.plist, and is what Sparkle actually compares
+# when deciding whether a feed item is newer.
+#
+# Invariant, enforced by scripts/version-plan.sh: Beta is always at or ahead of
+# Stable. Both channels are served by ONE build and ONE appcast — beta items
+# carry <sparkle:channel>beta</sparkle:channel>, stable items carry no channel
+# tag at all (that is Sparkle 2's semantics, not a shortcut).
+#
+# A stable release is TWO publishes, in this order:
+#   ./scripts/build-dmg.sh --beta   --publish   # bumps BETA past the lead
+#   ...soak it...
+#   ./scripts/build-dmg.sh --stable --publish   # promotes STABLE to that lead
+#
+# These lines are rewritten by build-dmg.sh after a successful publish. Don't
+# hand-edit them mid-release.
+#
+# Product facts (each app in the family has its OWN, never shared):
+#   bundle id : com.irvcassio.ClaudeSwitch
+#   feed      : https://www.doppoworks.com/downloads/claudeswitch/appcast.xml
+#   keypair   : EdDSA, Keychain account "claudeswitch" (sign_update -f/--account)
+#
+STABLE=1.0.0
+BETA=1.0.0
