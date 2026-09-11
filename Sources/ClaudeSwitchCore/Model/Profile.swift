@@ -4,7 +4,7 @@ import Foundation
 ///
 /// `.anthropic` is the absence of configuration: no managed env keys on disk, so Claude Code
 /// falls back to the subscription. Every other profile is a gateway that speaks the Anthropic
-/// Messages API — on this network, aiserver's LiteLLM on :4000.
+/// Messages API — typically a LiteLLM proxy you run yourself.
 public struct Profile: Codable, Identifiable, Hashable {
     public var id: UUID = UUID()
     public var name: String
@@ -28,19 +28,18 @@ public struct Profile: Codable, Identifiable, Hashable {
     /// Values Qwen3.8 will actually accept. `high` and `max` 500 on the first turn.
     public static let qwenSafeEffortLevels = ["low", "medium", "xhigh"]
 
-    /// Defaults verified against the live gateway on 2026-09-11.
-    ///
-    /// The model id is the `qwen38-claude` alias, which the gateway now publishes and developer
-    /// keys are scoped to. It is preferred over the raw `Qwen/Qwen3.8-27B-FP8` because "claude"
-    /// in the id is what makes `/model` willing to list it.
-    public static func aiserver() -> Profile {
+    /// An empty gateway for the user to fill in. Deliberately carries no address and no model
+    /// ids — ClaudeSwitch ships with no gateway of its own, so nothing here points anywhere
+    /// until someone types it. The numeric defaults are the only safe guesses: they are the
+    /// limits, not the destination.
+    public static func blank(name: String = "New gateway") -> Profile {
         Profile(
-            name: "aiserver — Qwen3.8-27B",
-            baseURL: "http://10.80.114.11:4000",
-            model: "qwen38-claude",
-            haikuModel: "qwen38-claude",
-            sonnetModel: "qwen38-claude",
-            opusModel: "qwen38-claude",
+            name: name,
+            baseURL: "",
+            model: "",
+            haikuModel: "",
+            sonnetModel: "",
+            opusModel: "",
             effortLevel: "medium",
             contextWindow: 131072,
             maxOutputTokens: 16384,
@@ -121,15 +120,6 @@ extension Profile {
                 out.append(Warning(severity: .caution, message:
                     "\(label) model '\(id)' has neither 'claude' nor 'anthropic' in its id, so "
                     + "/model will hide it. The session still works — this only affects the picker."))
-            }
-        }
-
-        // The id trap: the unprefixed form is a different team's box entirely.
-        for (label, id) in [("Model", model), ("Haiku", haikuModel), ("Sonnet", sonnetModel), ("Opus", opusModel)] {
-            if id == "Qwen3.8-27B-FP8" {
-                out.append(Warning(severity: .caution, message:
-                    "\(label) model 'Qwen3.8-27B-FP8' without the 'Qwen/' prefix routes to "
-                    + "10.224.10.134:8003 — a different team's server. Use 'Qwen/Qwen3.8-27B-FP8'."))
             }
         }
 

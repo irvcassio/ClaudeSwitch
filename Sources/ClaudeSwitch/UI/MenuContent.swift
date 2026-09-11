@@ -39,6 +39,10 @@ struct MenuContent: View {
         }
         .disabled(controller.isBusy)
 
+        if controller.profiles.isEmpty {
+            Text("No gateways yet — add one in Settings")
+        }
+
         ForEach(controller.profiles) { profile in
             Button {
                 Task { await controller.switchTo(profile) }

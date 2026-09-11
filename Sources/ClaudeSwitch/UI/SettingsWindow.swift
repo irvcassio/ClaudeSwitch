@@ -23,6 +23,12 @@ struct SettingsWindow: View {
         NavigationSplitView {
             List(selection: $selection) {
                 Section("Gateways") {
+                    if controller.profiles.isEmpty {
+                        Text("No gateways yet. Add one with + below.")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .padding(.vertical, 4)
+                    }
                     ForEach(controller.profiles) { profile in
                         HStack {
                             Image(systemName: controller.activeProfile?.id == profile.id
@@ -31,7 +37,7 @@ struct SettingsWindow: View {
                                                  ? .green : .secondary)
                             VStack(alignment: .leading) {
                                 Text(profile.name)
-                                Text(profile.baseURL)
+                                Text(profile.baseURL.isEmpty ? "No address yet" : profile.baseURL)
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             }
@@ -119,7 +125,7 @@ private struct ProfileEditor: View {
         Form {
             Section("Identity") {
                 TextField("Name", text: $draft.name)
-                TextField("Base URL", text: $draft.baseURL, prompt: Text("http://10.80.114.11:4000"))
+                TextField("Base URL", text: $draft.baseURL, prompt: Text("http://gateway.example:4000"))
                     .autocorrectionDisabled()
                 Text("Without a trailing /v1 — Claude Code appends the Anthropic paths itself. "
                      + "Port 4000 is the gateway; 8001 is vLLM and has no /v1/messages route.")
@@ -164,10 +170,10 @@ private struct ProfileEditor: View {
                           format: .number.grouping(.never))
                 TextField("Max output tokens", value: $draft.maxOutputTokens,
                           format: .number.grouping(.never))
-                Text("Set the context window to the same number vLLM was started with — 131072 "
-                     + "for aiserver. Guessing it makes compaction fire early or overflow the "
-                     + "server. The output ceiling is the only guard against Qwen3.8 spiralling "
-                     + "in its reasoning block.")
+                Text("Set the context window to the same number the model server was started "
+                     + "with. Guessing it makes compaction fire early or overflow the server. "
+                     + "The output ceiling is the only guard against a reasoning model "
+                     + "spiralling in its thinking block.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

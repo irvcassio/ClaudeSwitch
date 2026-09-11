@@ -1,70 +1,73 @@
 import Testing
 @testable import ClaudeSwitchCore
 
-/// Each of these corresponds to a trap in the aiserver developer guide. Catching them in the
-/// UI is the whole point — every one of them otherwise costs an afternoon.
+/// Each of these corresponds to a trap you hit when pointing Claude Code at a self-hosted
+/// gateway. Catching them in the UI is the whole point — every one of them otherwise costs
+/// an afternoon.
 @Suite("Profile validation")
 struct ProfileTests {
-    @Test("The aiserver default is valid")
-    func defaultIsUsable() {
-        #expect(Profile.aiserver().isUsable)
-        #expect(Profile.aiserver().staticWarnings.allSatisfy { $0.severity != .blocking })
+    /// A stand-in gateway. Deliberately a documentation host: nothing in this repo should carry
+    /// a real address.
+    static func fixture() -> Profile {
+        var p = Profile.blank(name: "Example gateway")
+        p.baseURL = "http://gateway.example:4000"
+        p.model = "claude-proxy"
+        p.haikuModel = "claude-proxy"
+        p.sonnetModel = "claude-proxy"
+        p.opusModel = "claude-proxy"
+        return p
     }
 
-    @Test("The aiserver default uses the id the gateway actually publishes")
-    func defaultUsesPublishedID() {
-        // Verified against the live gateway on 2026-09-11: /v1/models publishes qwen38-claude,
-        // and a developer key scoped to it returns 200 on /v1/messages.
-        let profile = Profile.aiserver()
-        #expect(profile.model == "qwen38-claude")
-        #expect(profile.haikuModel == profile.model)
-        // "claude" in the id is the only reason /model is willing to list it.
-        #expect(profile.model.contains("claude"))
+    @Test("A new gateway starts empty — no address, no model, not switchable")
+    func blankCarriesNoDestination() {
+        let blank = Profile.blank()
+        #expect(blank.baseURL.isEmpty)
+        #expect(blank.model.isEmpty)
+        #expect(blank.haikuModel.isEmpty)
+        // Unusable on purpose: there is nowhere to switch to until the user fills it in.
+        #expect(!blank.isUsable)
     }
 
-    @Test("Blocks vLLM's port — it has no /v1/messages route", arguments: [
-        "http://10.80.114.11:8001",
-        "http://10.80.114.11:11434",
-        "http://10.80.114.11:4000/v1",
-        "http://10.80.114.11:4000/v1/",
+    @Test("A filled-in gateway is valid")
+    func fixtureIsUsable() {
+        #expect(Self.fixture().isUsable)
+        #expect(Self.fixture().staticWarnings.allSatisfy { $0.severity != .blocking })
+    }
+
+    @Test("Blocks base URLs that cannot serve /v1/messages", arguments: [
+        "http://gateway.example:8001",
+        "http://gateway.example:11434",
+        "http://gateway.example:4000/v1",
+        "http://gateway.example:4000/v1/",
     ])
     func blocksBadBaseURLs(url: String) {
-        var profile = Profile.aiserver()
+        var profile = Self.fixture()
         profile.baseURL = url
         #expect(!profile.isUsable)
     }
 
-    @Test("Warns about the unprefixed id, which is another team's server")
-    func warnsOnUnprefixedModelID() {
-        var profile = Profile.aiserver()
-        profile.model = "Qwen3.8-27B-FP8"
-        #expect(profile.staticWarnings.contains { $0.message.contains("different team") })
-        // A caution, not a blocker: it is a real id, just the wrong one.
-        #expect(profile.isUsable)
-    }
-
     @Test("Warns about effort levels Qwen3.8 rejects", arguments: ["high", "max"])
     func warnsOnBadEffort(level: String) {
-        var profile = Profile.aiserver()
+        var profile = Self.fixture()
         profile.effortLevel = level
         #expect(profile.staticWarnings.contains { $0.message.contains("500") })
     }
 
     @Test("Warns when an id will be hidden by the model picker")
     func warnsOnPickerFilter() {
-        var profile = Profile.aiserver()
+        var profile = Self.fixture()
         profile.model = "plain-qwen"
         #expect(profile.staticWarnings.contains { $0.message.contains("/model will hide it") })
     }
 
     @Test("Warns that plain HTTP puts the key on the wire in the clear")
     func warnsOnPlainHTTP() {
-        #expect(Profile.aiserver().staticWarnings.contains { $0.message.contains("clear") })
+        #expect(Self.fixture().staticWarnings.contains { $0.message.contains("clear") })
     }
 
-    @Test("Writes every variable the guide marks required")
+    @Test("Writes every variable a gateway needs")
     func environmentCoversRequiredKeys() {
-        let env = Profile.aiserver().environment(authToken: "sk-x")
+        let env = Self.fixture().environment(authToken: "sk-x")
         let keys = Set(env.map(\.key))
         for required in ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_MODEL",
                          "ANTHROPIC_DEFAULT_HAIKU_MODEL", "CLAUDE_CODE_EFFORT_LEVEL",
@@ -78,7 +81,7 @@ struct ProfileTests {
 
     @Test("Every key it writes is one it declares it owns")
     func writesOnlyManagedKeys() {
-        var maximal = Profile.aiserver()
+        var maximal = Self.fixture()
         maximal.enableGatewayModelDiscovery = true
         for pair in maximal.environment(authToken: "sk-x") {
             #expect(ClaudeSettingsStore.managedKeys.contains(pair.key),

@@ -4,6 +4,18 @@ import Testing
 
 @Suite("Settings store")
 struct ClaudeSettingsStoreTests {
+    /// A stand-in gateway on a documentation host. Fully filled in, so it writes every key it
+    /// can — the counts below depend on that.
+    static func fixture() -> Profile {
+        var p = Profile.blank(name: "Example gateway")
+        p.baseURL = "http://gateway.example:4000"
+        p.model = "claude-proxy"
+        p.haikuModel = "claude-proxy"
+        p.sonnetModel = "claude-proxy"
+        p.opusModel = "claude-proxy"
+        return p
+    }
+
     /// Each test gets a throwaway settings file; none of them touch the real one.
     private func makeStore(_ contents: String? = nil) throws -> ClaudeSettingsStore {
         let dir = FileManager.default.temporaryDirectory.appending(path: "cs-\(UUID().uuidString)")
@@ -30,7 +42,7 @@ struct ClaudeSettingsStoreTests {
 
         """
         let store = try makeStore(original)
-        try store.apply(profile: .aiserver(), authToken: "sk-test")
+        try store.apply(profile: Self.fixture(), authToken: "sk-test")
         #expect(try store.readManagedEnvironment().count == 10)
 
         try store.clearManagedEnvironment()
@@ -43,7 +55,7 @@ struct ClaudeSettingsStoreTests {
         // first write. That is a reformat, not a change: every key, value and order survives.
         let original = #"{"permissions": {"allow": ["Bash(*)"]}, "theme": "light"}"#
         let store = try makeStore(original)
-        try store.apply(profile: .aiserver(), authToken: "sk-test")
+        try store.apply(profile: Self.fixture(), authToken: "sk-test")
         try store.clearManagedEnvironment()
 
         let before = try JSONSerialization.jsonObject(with: Data(original.utf8)) as? NSDictionary
@@ -57,7 +69,7 @@ struct ClaudeSettingsStoreTests {
     @Test("Leaves the user's own env keys alone")
     func preservesUnmanagedKeys() throws {
         let store = try makeStore(#"{"env": {"MY_OWN": "keep-me"}}"#)
-        try store.apply(profile: .aiserver(), authToken: "sk-test")
+        try store.apply(profile: Self.fixture(), authToken: "sk-test")
         #expect(try store.readUnmanagedEnvironment()["MY_OWN"] == "keep-me")
 
         try store.clearManagedEnvironment()
@@ -68,17 +80,17 @@ struct ClaudeSettingsStoreTests {
     @Test("Replaces a stale value instead of leaving both")
     func replacesStaleValues() throws {
         let store = try makeStore(#"{"env": {"ANTHROPIC_BASE_URL": "http://stale:1"}}"#)
-        try store.apply(profile: .aiserver(), authToken: "sk-test")
-        #expect(try store.readManagedEnvironment()["ANTHROPIC_BASE_URL"] == "http://10.80.114.11:4000")
+        try store.apply(profile: Self.fixture(), authToken: "sk-test")
+        #expect(try store.readManagedEnvironment()["ANTHROPIC_BASE_URL"] == "http://gateway.example:4000")
     }
 
     @Test("Drops optional keys a profile turns off")
     func dropsOptionalKeys() throws {
         let store = try makeStore()
-        try store.apply(profile: .aiserver(), authToken: "sk-test")
+        try store.apply(profile: Self.fixture(), authToken: "sk-test")
         #expect(try store.readManagedEnvironment()["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] != nil)
 
-        var lean = Profile.aiserver()
+        var lean = Self.fixture()
         lean.maxOutputTokens = 0
         lean.disableNonessentialTraffic = false
         try store.apply(profile: lean, authToken: "sk-test")
@@ -92,7 +104,7 @@ struct ClaudeSettingsStoreTests {
     @Test("Removes an env block it emptied, rather than leaving env: {}")
     func removesEmptiedEnvBlock() throws {
         let store = try makeStore(#"{"theme": "light"}"#)
-        try store.apply(profile: .aiserver(), authToken: "sk-test")
+        try store.apply(profile: Self.fixture(), authToken: "sk-test")
         try store.clearManagedEnvironment()
         let root = try JSONValue.parse(try String(contentsOf: store.url, encoding: .utf8))
         #expect(root["env"] == nil)
@@ -103,7 +115,7 @@ struct ClaudeSettingsStoreTests {
     func createsMissingFile() throws {
         let store = try makeStore()
         #expect(try store.readManagedEnvironment().isEmpty)
-        try store.apply(profile: .aiserver(), authToken: "sk-test")
+        try store.apply(profile: Self.fixture(), authToken: "sk-test")
         #expect(FileManager.default.fileExists(atPath: store.url.path))
     }
 
@@ -112,7 +124,7 @@ struct ClaudeSettingsStoreTests {
         let store = try makeStore(#"{ "broken": "#)
         let before = try String(contentsOf: store.url, encoding: .utf8)
         #expect(throws: (any Error).self) {
-            try store.apply(profile: .aiserver(), authToken: "sk-test")
+            try store.apply(profile: Self.fixture(), authToken: "sk-test")
         }
         #expect(try String(contentsOf: store.url, encoding: .utf8) == before)
     }
@@ -121,18 +133,18 @@ struct ClaudeSettingsStoreTests {
     func refusesNonObjectRoot() throws {
         let store = try makeStore("[1, 2, 3]")
         #expect(throws: (any Error).self) {
-            try store.apply(profile: .aiserver(), authToken: "sk-test")
+            try store.apply(profile: Self.fixture(), authToken: "sk-test")
         }
     }
 
     @Test("Backs the file up once, and never overwrites the backup")
     func backsUpOnce() throws {
         let store = try makeStore(#"{"theme": "original"}"#)
-        try store.apply(profile: .aiserver(), authToken: "sk-test")
+        try store.apply(profile: Self.fixture(), authToken: "sk-test")
         let backup = try String(contentsOf: store.backupURL, encoding: .utf8)
         #expect(backup.contains("original"))
 
-        try store.apply(profile: .aiserver(), authToken: "sk-test-2")
+        try store.apply(profile: Self.fixture(), authToken: "sk-test-2")
         #expect(try String(contentsOf: store.backupURL, encoding: .utf8) == backup)
     }
 

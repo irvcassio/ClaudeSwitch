@@ -194,11 +194,12 @@ final class SwitchController {
     // MARK: - Profile persistence
 
     func loadProfiles() {
+        // A fresh install has no gateways. ClaudeSwitch does not know about anyone's network,
+        // so it must not invent a destination — the user adds one with the + button.
         guard let data = try? Data(contentsOf: profilesURL),
               let decoded = try? JSONDecoder().decode([Profile].self, from: data)
         else {
-            profiles = [.aiserver()]
-            saveProfiles()
+            profiles = []
             return
         }
         profiles = decoded
@@ -219,9 +220,7 @@ final class SwitchController {
     }
 
     func addProfile() -> Profile {
-        var new = Profile.aiserver()
-        new.id = UUID()
-        new.name = "New gateway"
+        let new = Profile.blank()
         profiles.append(new)
         saveProfiles()
         return new

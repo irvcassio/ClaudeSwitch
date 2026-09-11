@@ -3,7 +3,7 @@ import Testing
 
 /// The streaming half of the Anthropic dialect, which is the only half Claude Code uses.
 ///
-/// These bodies are trimmed copies of what aiserver's LiteLLM actually returned on 2026-09-11:
+/// These bodies are trimmed copies of what a LiteLLM gateway actually returned on 2026-09-11:
 /// the non-streamed turn was perfect, and the streamed one opened a content block it never
 /// closed — so Claude Code discarded the text and every reply arrived blank.
 @Suite("Streaming SSE contract")
