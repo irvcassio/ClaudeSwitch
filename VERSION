@@ -30,4 +30,4 @@
 #               every --publish happen on the build machine only.
 #
 STABLE=1.0.0
-BETA=1.0.0
+BETA=1.0.1

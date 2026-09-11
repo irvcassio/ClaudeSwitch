@@ -9,5 +9,5 @@
 // exists. It decides nothing.
 public enum AppVersion {
     public static let marketing = "1.0.1"
-    public static let build = "2"
+    public static let build = "4"
 }
