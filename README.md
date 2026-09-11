@@ -36,8 +36,44 @@ so the file returns to exactly what it was.
 git clone https://github.com/irvcassio/ClaudeSwitch.git && cd ClaudeSwitch && ./scripts/build-dmg.sh
 ```
 
-Then mount `build/release/ClaudeSwitch-*.dmg` and drag the app to `/Applications`. Requires
-macOS 14+ and a Swift 6 toolchain (Xcode 16 or the standalone toolchain).
+Then mount `build.noindex/release/ClaudeSwitch-*.dmg` and drag the app to `/Applications`.
+Requires macOS 14+ and a Swift 6 toolchain (Xcode 16 or the standalone toolchain).
+
+Once installed, the app updates itself through Sparkle — **Settings… → Updates** picks the
+channel (Stable or Beta) and checks on demand.
+
+## Releasing
+
+Two channels, one build, one appcast. The visible version of each channel lives in
+[`VERSION`](VERSION); `scripts/version-plan.sh` keeps Beta at or ahead of Stable.
+
+```bash
+./scripts/build-dmg.sh                      # local unsigned build, no publish
+./scripts/build-dmg.sh --beta   --publish   # cut a Beta
+./scripts/build-dmg.sh --stable --publish   # promote that Beta to Stable
+```
+
+A stable release is always those last two steps in order, with a soak in between: a
+`--stable --publish` that would not advance past the current Stable is refused, because
+nothing has been through Beta to promote.
+
+`--publish` signs the appcast, uploads the DMG as a release asset on the public
+`app-downloads` repo, commits the feed to the site repo, and only reports success after
+fetching the live feed and finding the new build in it. It refuses outright to publish an
+ad-hoc-signed, un-notarized, or unstapled artifact.
+
+Before the first publish, on the machine that holds the site repo:
+
+1. Generate ClaudeSwitch's **own** EdDSA keypair — `generate_keys --account claudeswitch`
+   from Sparkle's `bin/`, exported with `-x`. Never reuse another app's key: one
+   compromise would forge updates for every product sharing it.
+2. Copy [`scripts/signing.env.example`](scripts/signing.env.example) to
+   `scripts/signing.env` (gitignored) and fill in the signing identity, notary profile,
+   and both key values.
+3. Bootstrap an empty, well-formed `appcast.xml` at `public/downloads/claudeswitch/` in
+   the site repo.
+4. Verify `SUPublicEDKey` and `SUFeedURL` in the **installed** app, then set
+   `CLAUDESWITCH_SPARKLE_READY=1` in `signing.env` to unlock `--publish`.
 
 ## Using it
 
@@ -115,8 +151,12 @@ Sources/ClaudeSwitchCore/     testable core, no UI
   Model/Profile.swift         profile + validation warnings
   Services/                   settings store, gateway probe, keychain, diagnostics
 Sources/ClaudeSwitch/         SwiftUI MenuBarExtra app (LSUIElement, no Dock icon)
+Sources/ClaudeSwitchUpdates/  Sparkle updater service + the Updates settings pane
 Tests/ClaudeSwitchCoreTests/  swift-testing; the codec is the most heavily tested part
-scripts/build-dmg.sh          test → build → bundle → sign → DMG
+VERSION                       visible version per channel — the source of truth
+scripts/build-dmg.sh          test → build → bundle → sign → notarize → DMG → publish
+scripts/version-plan.sh       per-channel version arithmetic (--selftest)
+scripts/preflight-signing.sh  proves the identity can sign before a build spends a number
 ```
 
 ```bash
