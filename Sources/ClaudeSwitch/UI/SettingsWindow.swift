@@ -1,4 +1,5 @@
 import ClaudeSwitchCore
+import ClaudeSwitchUpdates
 import SwiftUI
 
 /// Sidebar destinations. Diagnostics is a peer of the gateways, not a fallback for having
@@ -6,6 +7,7 @@ import SwiftUI
 private enum Destination: Hashable {
     case gateway(UUID)
     case diagnostics
+    case updates
 }
 
 struct SettingsWindow: View {
@@ -41,6 +43,8 @@ struct SettingsWindow: View {
                 Section {
                     Label("Diagnostics", systemImage: "stethoscope")
                         .tag(Destination.diagnostics)
+                    Label("Updates", systemImage: "arrow.down.circle")
+                        .tag(Destination.updates)
                 }
             }
             .frame(minWidth: 220)
@@ -76,6 +80,8 @@ struct SettingsWindow: View {
                let index = controller.profiles.firstIndex(where: { $0.id == id }) {
                 ProfileEditor(profile: controller.profiles[index])
                     .id(id)
+            } else if selection == .updates {
+                UpdatesSettingsView()
             } else {
                 DiagnosticsPane()
             }

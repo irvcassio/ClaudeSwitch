@@ -1,4 +1,5 @@
 import ClaudeSwitchCore
+import ClaudeSwitchUpdates
 import SwiftUI
 
 struct MenuContent: View {
@@ -82,6 +83,10 @@ struct MenuContent: View {
             NSApp.activate(ignoringOtherApps: true)
         }
         .keyboardShortcut(",", modifiers: .command)
+
+        Divider()
+
+        UpdateMenuItems()
 
         Divider()
 
