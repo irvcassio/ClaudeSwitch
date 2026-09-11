@@ -340,6 +340,11 @@ private struct ProbeSummary: View {
     var body: some View {
         LabeledContent("Reachable", value: probe.reachable ? "yes" : "no")
         LabeledContent("Anthropic route (/v1/messages)", value: probe.messagesRouteOK ? "answers" : "no")
+        // The row that matters: Claude Code only ever streams, and this is the half that breaks
+        // on its own while the row above stays green.
+        LabeledContent("Streamed replies (SSE)",
+                       value: probe.streamingRouteOK ? "well-formed"
+                            : probe.messagesRouteOK ? "malformed" : "not checked")
         if let latency = probe.latency {
             let ms = Int(latency.components.seconds) * 1000
                 + Int(Double(latency.components.attoseconds) / 1e15)

@@ -13,13 +13,13 @@ struct ProfileTests {
 
     @Test("The aiserver default uses the id the gateway actually publishes")
     func defaultUsesPublishedID() {
-        // Verified against the live gateway: qwen38-claude was never added, and a scoped key
-        // answers 403 for it. The prefixed id is the one that returns 200 on /v1/messages.
+        // Verified against the live gateway on 2026-09-11: /v1/models publishes qwen38-claude,
+        // and a developer key scoped to it returns 200 on /v1/messages.
         let profile = Profile.aiserver()
-        #expect(profile.model == "Qwen/Qwen3.8-27B-FP8")
+        #expect(profile.model == "qwen38-claude")
         #expect(profile.haikuModel == profile.model)
-        // The prefix matters: the unprefixed form is a different team's server.
-        #expect(profile.model.hasPrefix("Qwen/"))
+        // "claude" in the id is the only reason /model is willing to list it.
+        #expect(profile.model.contains("claude"))
     }
 
     @Test("Blocks vLLM's port — it has no /v1/messages route", arguments: [

@@ -44,9 +44,12 @@ macOS 14+ and a Swift 6 toolchain (Xcode 16 or the standalone toolchain).
 1. **Settings… → your gateway profile.** Fill in base URL, model id, effort level, context window.
    Paste the gateway key — it goes into the login Keychain, never into a config file.
 2. **Click the destination in the menu.** ClaudeSwitch probes the gateway *before* it writes:
-   `/v1/models` to confirm the ids you configured are actually served, then `/v1/messages` to
-   confirm the gateway speaks the Anthropic dialect. A failed probe leaves `settings.json`
-   untouched and tells you which of the two failed and why.
+   `/v1/models` to confirm the ids you configured are actually served, `/v1/messages` to confirm
+   the gateway speaks the Anthropic dialect, then the same route with `stream: true` to confirm it
+   speaks the *SSE* half of that dialect — the only half Claude Code ever uses. The third check
+   exists because a gateway can pass the first two and still hand Claude Code nothing but blank
+   replies. A failed probe leaves `settings.json` untouched and tells you which check failed and
+   why.
 3. **Relaunch Claude.** The menu says so, and offers to relaunch the desktop app for you.
    Claude Code reads `settings.json` at launch, so already-running CLI sessions stay on the old
    destination until you start a new one — the menu counts them for you.
@@ -93,6 +96,7 @@ warnings so you find out before you switch rather than mid-session:
 | Symptom | Cause |
 | --- | --- |
 | `unrecognized_model`, and the CLI refuses to run | Claude Code only accepts model ids containing `claude` or `anthropic`. A raw id like `Qwen/Qwen3.8-27B-FP8` is rejected client-side no matter what the gateway serves. Your gateway needs an alias whose name contains `claude`. |
+| Every reply is blank, but tokens are billed and `stop_reason` looks fine | The gateway's Anthropic **streaming** adapter opens a `content_block_start` and never sends the matching `content_block_stop`. Claude Code discards an unclosed block, so the text is thrown away while the turn "succeeds". Non-streaming works, which is why the gateway looks healthy and why an OpenAI-dialect client on the same box (Doppo Console, anything on `/v1/chat/completions`) is unaffected. No client-side setting works around it: fix it on the gateway. For LiteLLM, give the model the `hosted_vllm/` provider prefix instead of `openai/`, then upgrade the proxy. ClaudeSwitch's third probe check refuses to switch into this. |
 | HTTP 404 on the first turn | You pointed at vLLM directly. vLLM has no `/v1/messages`; that route is the gateway's job. |
 | HTTP 500 on the first turn | Effort level. Qwen3.8 rejects `high` and `max`; use `low`, `medium` or `xhigh`. |
 | HTTP 403 naming models you didn't ask for | Your key is scoped to a model list that doesn't include the id you configured. |

@@ -28,20 +28,19 @@ public struct Profile: Codable, Identifiable, Hashable {
     /// Values Qwen3.8 will actually accept. `high` and `max` 500 on the first turn.
     public static let qwenSafeEffortLevels = ["low", "medium", "xhigh"]
 
-    /// Defaults verified against the live gateway on 2026-09-08.
+    /// Defaults verified against the live gateway on 2026-09-11.
     ///
-    /// The model id is the prefixed `Qwen/Qwen3.8-27B-FP8`, which is what `/v1/models` actually
-    /// publishes — the `qwen38-claude` alias the developer guide proposes was never added, and a
-    /// key scoped to the real id answers 403 for it. The cost is that `/model` hides this id
-    /// (no "claude" in it), which is cosmetic: `ANTHROPIC_MODEL` overrides the picker anyway.
+    /// The model id is the `qwen38-claude` alias, which the gateway now publishes and developer
+    /// keys are scoped to. It is preferred over the raw `Qwen/Qwen3.8-27B-FP8` because "claude"
+    /// in the id is what makes `/model` willing to list it.
     public static func aiserver() -> Profile {
         Profile(
             name: "aiserver — Qwen3.8-27B",
             baseURL: "http://10.80.114.11:4000",
-            model: "Qwen/Qwen3.8-27B-FP8",
-            haikuModel: "Qwen/Qwen3.8-27B-FP8",
-            sonnetModel: "Qwen/Qwen3.8-27B-FP8",
-            opusModel: "Qwen/Qwen3.8-27B-FP8",
+            model: "qwen38-claude",
+            haikuModel: "qwen38-claude",
+            sonnetModel: "qwen38-claude",
+            opusModel: "qwen38-claude",
             effortLevel: "medium",
             contextWindow: 131072,
             maxOutputTokens: 16384,

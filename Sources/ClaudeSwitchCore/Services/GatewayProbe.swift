@@ -2,25 +2,29 @@ import Foundation
 
 /// Verifies a profile end to end before the user commits to it.
 ///
-/// Two checks, because they fail independently and for different reasons: `/v1/models` proves
+/// Three checks, because they fail independently and for different reasons: `/v1/models` proves
 /// the key is valid and tells us which aliases exist; `/v1/messages` proves the Anthropic route
-/// answers. The second is the one that matters — it is the route Claude Code uses and the one
-/// vLLM does not have.
+/// answers; the same route with `stream: true` proves it speaks the *SSE* half of the dialect,
+/// which is the only half Claude Code ever uses. A gateway can pass the first two and still
+/// hand Claude Code nothing but blank replies.
 public enum GatewayProbe {
     public struct Result {
         public var reachable: Bool
         public var publishedModels: [String]
         public var messagesRouteOK: Bool
+        public var streamingRouteOK: Bool
         public var latency: Duration?
         public var findings: [Warning]
 
-        /// Green only when a real turn completed. Publishing a name proves nothing about serving it.
-        public var isHealthy: Bool { reachable && messagesRouteOK }
+        /// Green only when a real *streamed* turn completed with well-formed events. Publishing a
+        /// name proves nothing about serving it, and a good non-streamed turn proves nothing
+        /// about the route Claude Code actually calls.
+        public var isHealthy: Bool { reachable && messagesRouteOK && streamingRouteOK }
     }
 
     public static func run(profile: Profile, authToken: String, timeout: TimeInterval = 8) async -> Result {
         var result = Result(reachable: false, publishedModels: [], messagesRouteOK: false,
-                            latency: nil, findings: [])
+                            streamingRouteOK: false, latency: nil, findings: [])
 
         guard let base = URL(string: profile.baseURL) else {
             result.findings.append(Warning(severity: .blocking, message: "Base URL is not a valid URL."))
@@ -109,7 +113,88 @@ public enum GatewayProbe {
                 "/v1/messages failed: \(error.localizedDescription)"))
         }
 
+        // 3 — the same route again, streamed. Claude Code only ever streams, so a gateway that
+        // passes step 2 and fails here looks perfectly healthy and returns nothing but blanks.
+        guard result.messagesRouteOK else { return result }
+        do {
+            var request = URLRequest(url: base.appending(path: "v1/messages"))
+            request.httpMethod = "POST"
+            request.setValue("Bearer \(authToken)", forHTTPHeaderField: "Authorization")
+            request.setValue("application/json", forHTTPHeaderField: "content-type")
+            request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+            request.httpBody = try JSONSerialization.data(withJSONObject: [
+                "model": profile.model,
+                "max_tokens": 32,
+                "stream": true,
+                "messages": [["role": "user", "content": "Count: one two three"]],
+            ])
+
+            let (data, response) = try await session.data(for: request)
+            let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+            guard code == 200 else {
+                let body = String(data: data.prefix(240), encoding: .utf8) ?? ""
+                result.findings.append(Warning(severity: .blocking, message:
+                    "Streamed /v1/messages returned HTTP \(code), while the non-streamed call "
+                    + "succeeded. Claude Code only streams. \(body)"))
+                return result
+            }
+            result.findings.append(contentsOf:
+                checkSSE(String(data: data, encoding: .utf8) ?? "", into: &result))
+        } catch {
+            result.findings.append(Warning(severity: .blocking, message:
+                "Streamed /v1/messages failed: \(error.localizedDescription)"))
+        }
+
         return result
+    }
+
+    /// The SSE contract Claude Code enforces: every `content_block_start` is matched by a
+    /// `content_block_stop`, and the message is terminated. An unclosed block is *discarded* —
+    /// usage and `stop_reason` survive the turn, the text does not.
+    static func checkSSE(_ body: String, into result: inout Result) -> [Warning] {
+        var counts: [String: Int] = [:]
+        for line in body.split(separator: "\n", omittingEmptySubsequences: true)
+        where line.hasPrefix("event:") {
+            let name = line.dropFirst(6).trimmingCharacters(in: .whitespaces)
+            counts[name, default: 0] += 1
+        }
+
+        guard !counts.isEmpty else {
+            return [Warning(severity: .blocking, message:
+                "The streamed response carried no SSE events at all. This is not an Anthropic "
+                + "Messages stream.")]
+        }
+
+        let started = counts["content_block_start"] ?? 0
+        let stopped = counts["content_block_stop"] ?? 0
+        let deltas = counts["content_block_delta"] ?? 0
+
+        if started > stopped {
+            return [Warning(severity: .blocking, message:
+                "The gateway's streaming adapter opened \(started) content block"
+                + (started == 1 ? "" : "s") + " and closed \(stopped). The Anthropic SSE contract "
+                + "requires one content_block_stop per content_block_start, and Claude Code "
+                + "discards any block left open — so every reply arrives blank even though the "
+                + "turn succeeds and tokens are billed. This is a gateway bug, not a setting: "
+                + "non-streaming works, and no client-side option can work around it. Fix it on "
+                + "the gateway (for LiteLLM, try the hosted_vllm/ provider prefix instead of "
+                + "openai/, then upgrade the proxy) before switching.")]
+        }
+
+        if deltas == 0 {
+            return [Warning(severity: .caution, message:
+                "The streamed turn emitted no text deltas. The stream is well-formed but the "
+                + "model produced nothing — check the effort level and max output tokens.")]
+        }
+
+        if counts["message_stop"] == nil {
+            return [Warning(severity: .blocking, message:
+                "The stream never sent message_stop, so Claude Code cannot tell a finished turn "
+                + "from a dropped connection.")]
+        }
+
+        result.streamingRouteOK = true
+        return []
     }
 
     /// A liveness ping for the menu's status line. No key needed, so it can run on a timer.
