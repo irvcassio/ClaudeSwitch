@@ -264,6 +264,26 @@ private struct DiagnosticsPane: View {
                 Button("Show settings.json in Finder") { controller.revealSettingsFile() }
             }
 
+            Section("Top-level overrides") {
+                if controller.topLevelOverrides.isEmpty {
+                    Text(controller.hasStashedOverrides
+                         ? "None in the file. Your originals are set aside and go back where they "
+                           + "were when you switch to Anthropic."
+                         : "None. No top-level key is contradicting the env block.")
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("These sit at the top level of settings.json and outrank the env block — "
+                         + "`model` beats ANTHROPIC_MODEL and `effortLevel` beats "
+                         + "CLAUDE_CODE_EFFORT_LEVEL. Switching to a gateway sets them aside and "
+                         + "restores them on the way back.")
+                        .font(.callout)
+                    ForEach(controller.topLevelOverrides.sorted(by: { $0.key < $1.key }), id: \.key) { entry in
+                        LabeledContent(entry.key, value: entry.value)
+                            .font(.system(.body, design: .monospaced))
+                    }
+                }
+            }
+
             Section("Shell overrides") {
                 if controller.shellOverrides.isEmpty {
                     Text("None. Nothing in your dotfiles contradicts settings.json.")

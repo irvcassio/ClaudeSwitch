@@ -148,6 +148,85 @@ struct ClaudeSettingsStoreTests {
         #expect(try String(contentsOf: store.backupURL, encoding: .utf8) == backup)
     }
 
+    // MARK: - Top-level overrides
+    //
+    // A top-level `model` outranks ANTHROPIC_MODEL, and `effortLevel` outranks
+    // CLAUDE_CODE_EFFORT_LEVEL. Leaving them in place is the failure this app exists to prevent:
+    // the switch reports success, and every turn still goes to the old destination.
+
+    @Test("Sets aside the top-level keys that outrank the env block")
+    func stripsOverridingTopLevelKeys() throws {
+        let store = try makeStore(#"{"model": "claude-opus-5", "effortLevel": "high", "theme": "light"}"#)
+        #expect(try store.readTopLevelOverrides().count == 2)
+
+        try store.apply(profile: Self.fixture(), authToken: "sk-test")
+        #expect(try store.readTopLevelOverrides().isEmpty)
+        #expect(try store.readManagedEnvironment()["ANTHROPIC_MODEL"] == "claude-proxy")
+        #expect(try store.readManagedEnvironment()["CLAUDE_CODE_EFFORT_LEVEL"] == "medium")
+    }
+
+    @Test("Puts each override back in the position it was found")
+    func restoresOverridesInPlace() throws {
+        let original = """
+        {
+          "model": "claude-opus-5",
+          "permissions": {
+            "allow": [
+              "Bash(*)"
+            ]
+          },
+          "effortLevel": "high",
+          "theme": "light"
+        }
+
+        """
+        let store = try makeStore(original)
+        try store.apply(profile: Self.fixture(), authToken: "sk-test")
+        try store.clearManagedEnvironment()
+        #expect(try String(contentsOf: store.url, encoding: .utf8) == original)
+        #expect(!FileManager.default.fileExists(atPath: store.overridesStashURL.path))
+    }
+
+    @Test("A second switch does not lose the originals")
+    func stashSurvivesRepeatedApply() throws {
+        let store = try makeStore(#"{"model": "claude-opus-5", "theme": "light"}"#)
+        try store.apply(profile: Self.fixture(), authToken: "sk-test")
+        // Updating the live profile applies again, and by then the key is already gone — the
+        // stash must not be overwritten with the empty set.
+        try store.apply(profile: Self.fixture(), authToken: "sk-test-2")
+
+        try store.clearManagedEnvironment()
+        let root = try JSONValue.parse(try String(contentsOf: store.url, encoding: .utf8))
+        #expect(root["model"]?.stringValue == "claude-opus-5")
+    }
+
+    @Test("Restores a non-string override as the value it was")
+    func restoresNonStringOverride() throws {
+        let store = try makeStore(#"{"effortLevel": null, "theme": "light"}"#)
+        try store.apply(profile: Self.fixture(), authToken: "sk-test")
+        try store.clearManagedEnvironment()
+        let root = try JSONValue.parse(try String(contentsOf: store.url, encoding: .utf8))
+        #expect(root["effortLevel"]?.serialized() == "null")
+    }
+
+    @Test("Picks up a key the user re-added while a gateway was active")
+    func stashesLateAdditions() throws {
+        let store = try makeStore(#"{"model": "claude-opus-5", "theme": "light"}"#)
+        try store.apply(profile: Self.fixture(), authToken: "sk-test")
+
+        // The user hand-edits effortLevel back in, then switches gateways.
+        var text = try String(contentsOf: store.url, encoding: .utf8)
+        text = text.replacingOccurrences(of: "{\n", with: "{\n  \"effortLevel\": \"high\",\n")
+        try text.write(to: store.url, atomically: true, encoding: .utf8)
+        try store.apply(profile: Self.fixture(), authToken: "sk-test")
+        #expect(try store.readTopLevelOverrides().isEmpty)
+
+        try store.clearManagedEnvironment()
+        let root = try JSONValue.parse(try String(contentsOf: store.url, encoding: .utf8))
+        #expect(root["model"]?.stringValue == "claude-opus-5")
+        #expect(root["effortLevel"]?.stringValue == "high")
+    }
+
     @Test("Clearing a file it never managed changes nothing")
     func clearIsNoOpWhenUnmanaged() throws {
         let store = try makeStore("{\n  \"theme\": \"light\"\n}\n")

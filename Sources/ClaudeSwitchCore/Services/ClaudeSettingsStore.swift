@@ -22,6 +22,13 @@ public struct ClaudeSettingsStore {
         "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",
     ]
 
+    /// Top-level settings that outrank the managed `env` block: `model` beats `ANTHROPIC_MODEL`,
+    /// and `effortLevel` beats `CLAUDE_CODE_EFFORT_LEVEL`. Left in place they make a switch look
+    /// successful while Claude Code keeps asking for a model the gateway does not publish, or for
+    /// an effort level it answers with HTTP 500. So they are set aside on the way to a gateway and
+    /// put back — in the position they were found — on the way back to Anthropic.
+    public static let overridingTopLevelKeys = ["model", "effortLevel"]
+
     public let url: URL
 
     public static var userSettings: ClaudeSettingsStore {
@@ -52,6 +59,17 @@ public struct ClaudeSettingsStore {
         return out
     }
 
+    /// The overriding top-level keys currently on disk. Non-empty while on a gateway means the
+    /// switch is being undermined; the app sets them aside so this normally reads empty.
+    public func readTopLevelOverrides() throws -> [String: String] {
+        guard let root = try readRoot(), let entries = root.objectEntries else { return [:] }
+        var out: [String: String] = [:]
+        for entry in entries where Self.overridingTopLevelKeys.contains(entry.key) {
+            out[entry.key] = entry.value.stringValue ?? entry.value.serialized()
+        }
+        return out
+    }
+
     private func readRoot() throws -> JSONValue? {
         guard FileManager.default.fileExists(atPath: url.path) else { return nil }
         let text = try String(contentsOf: url, encoding: .utf8)
@@ -71,6 +89,7 @@ public struct ClaudeSettingsStore {
                 env.append((key: pair.key, value: .string(pair.value)))
             }
             root["env"] = .object(env)
+            try setAsideTopLevelOverrides(in: &root)
         }
     }
 
@@ -78,10 +97,72 @@ public struct ClaudeSettingsStore {
     /// An `env` block left empty by this is removed too, rather than leaving `"env": {}` behind.
     public func clearManagedEnvironment() throws {
         try mutate { root in
-            guard var env = root["env"]?.objectEntries else { return }
-            env.removeAll { Self.managedKeys.contains($0.key) }
-            root["env"] = env.isEmpty ? nil : .object(env)
+            if var env = root["env"]?.objectEntries {
+                env.removeAll { Self.managedKeys.contains($0.key) }
+                root["env"] = env.isEmpty ? nil : .object(env)
+            }
+            try restoreTopLevelOverrides(in: &root)
         }
+        try? FileManager.default.removeItem(at: overridesStashURL)
+    }
+
+    // MARK: - Top-level overrides
+
+    /// Where the originals wait while a gateway is active. Sits next to the backup, so a user
+    /// who wants to undo everything by hand can see both.
+    public var overridesStashURL: URL {
+        url.deletingLastPathComponent().appending(path: url.lastPathComponent + ".claudeswitch-overrides")
+    }
+
+    /// `value` holds the original's serialized JSON rather than a string, so a non-string
+    /// override survives the round trip; `index` is where it sat among the top-level keys.
+    private struct StashedOverride: Codable {
+        let key: String
+        let index: Int
+        let value: String
+    }
+
+    private func setAsideTopLevelOverrides(in root: inout JSONValue) throws {
+        guard var entries = root.objectEntries else { return }
+
+        var found: [StashedOverride] = []
+        for key in Self.overridingTopLevelKeys {
+            guard let index = entries.firstIndex(where: { $0.key == key }) else { continue }
+            found.append(StashedOverride(key: key, index: index,
+                                         value: entries[index].value.serialized()))
+        }
+        guard !found.isEmpty else { return }
+
+        // Highest index first, so removing one does not shift the next.
+        for item in found.sorted(by: { $0.index > $1.index }) { entries.remove(at: item.index) }
+        root = .object(entries)
+
+        // An earlier stash is the true "before" state — keep it, and only add keys it is missing
+        // (a user can re-add `model` by hand while a gateway is already active).
+        var stash = loadStash()
+        stash.append(contentsOf: found.filter { item in !stash.contains { $0.key == item.key } })
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try encoder.encode(stash.sorted { $0.index < $1.index })
+            .write(to: overridesStashURL, options: .atomic)
+    }
+
+    /// Puts each stashed key back where it was found, so the file is byte-for-byte what it was.
+    /// Must run after the managed `env` block is gone, or the recorded indices are off by one.
+    private func restoreTopLevelOverrides(in root: inout JSONValue) throws {
+        let stash = loadStash()
+        guard !stash.isEmpty, var entries = root.objectEntries else { return }
+        for item in stash.sorted(by: { $0.index < $1.index }) {
+            guard !entries.contains(where: { $0.key == item.key }) else { continue }
+            let value = try JSONValue.parse(item.value)
+            entries.insert((key: item.key, value: value), at: min(item.index, entries.count))
+        }
+        root = .object(entries)
+    }
+
+    private func loadStash() -> [StashedOverride] {
+        guard let data = try? Data(contentsOf: overridesStashURL) else { return [] }
+        return (try? JSONDecoder().decode([StashedOverride].self, from: data)) ?? []
     }
 
     private func mutate(_ transform: (inout JSONValue) throws -> Void) throws {

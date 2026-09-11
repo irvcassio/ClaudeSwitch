@@ -26,6 +26,9 @@ final class SwitchController {
 
     private(set) var shellOverrides: [Diagnostics.ShellOverride] = []
     private(set) var runningCLISessions = 0
+    /// Top-level `model` / `effortLevel` still sitting in settings.json, where they outrank the
+    /// managed env block. Should be empty on a gateway — anything here is beating the switch.
+    private(set) var topLevelOverrides: [String: String] = [:]
 
     private let store = ClaudeSettingsStore.userSettings
     private let profilesURL = FileManager.default.homeDirectoryForCurrentUser
@@ -78,6 +81,12 @@ final class SwitchController {
     private func refreshDiagnostics() {
         shellOverrides = Diagnostics.shellOverrides()
         runningCLISessions = Diagnostics.runningCLISessionCount()
+        topLevelOverrides = (try? store.readTopLevelOverrides()) ?? [:]
+    }
+
+    /// Whether the originals are parked, waiting to be put back on the way to Anthropic.
+    var hasStashedOverrides: Bool {
+        FileManager.default.fileExists(atPath: store.overridesStashURL.path)
     }
 
     // MARK: - Switching
@@ -116,9 +125,19 @@ final class SwitchController {
         }
 
         do {
+            // Read them before the write, which is what removes them.
+            let setAside = (try? store.readTopLevelOverrides()) ?? [:]
             try store.apply(profile: profile, authToken: token)
             refresh()
-            statusNote = restartNote()
+            var note = restartNote()
+            if !setAside.isEmpty {
+                note += "\n\nSet aside \(setAside.keys.sorted().joined(separator: " and "))"
+                    + " from the top level of settings.json — "
+                    + (setAside.count == 1 ? "it outranks" : "they outrank")
+                    + " the env block, so the switch would not have taken effect. "
+                    + "Put back when you return to Anthropic."
+            }
+            statusNote = note
         } catch {
             lastError = error.localizedDescription
         }
