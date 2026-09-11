@@ -22,7 +22,12 @@
 # Product facts (each app in the family has its OWN, never shared):
 #   bundle id : com.irvcassio.ClaudeSwitch
 #   feed      : https://www.doppoworks.com/downloads/claudeswitch/appcast.xml
-#   keypair   : EdDSA, Keychain account "claudeswitch" (sign_update -f/--account)
+#   keypair   : EdDSA, generated on the build machine and kept there. The
+#               private half is an exported FILE, referenced by PATH from
+#               scripts/signing.env (SPARKLE_PRIVATE_KEY) and passed to
+#               sign_update -f. It is never committed, never inlined, and
+#               never copied off that machine — so keypair generation and
+#               every --publish happen on the build machine only.
 #
 STABLE=1.0.0
 BETA=1.0.0

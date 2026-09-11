@@ -70,17 +70,28 @@ which (`Download 1.0.2 (beta) →`). Only two lines are rewritten, the DMG filen
 link row; the card's copy is never generated. If the card is missing the publish prints
 the markup to add and carries on — the release is still live and still auto-updates.
 
-Before the first publish, on the machine that holds the site repo:
+Releases are cut on ONE machine — the build machine, which is the machine that
+holds the site repo. The keypair is generated there and never leaves it, so
+publishing from anywhere else is not a supported path. Before the first publish,
+on that machine:
 
-1. Generate ClaudeSwitch's **own** EdDSA keypair — `generate_keys --account claudeswitch`
-   from Sparkle's `bin/`, exported with `-x`. Never reuse another app's key: one
-   compromise would forge updates for every product sharing it.
+1. Generate ClaudeSwitch's **own** EdDSA keypair, on this build machine —
+   `generate_keys --account claudeswitch` from Sparkle's `bin/`, then export it with
+   `-x` to a file outside the repo. The exported private key is what signs the feed:
+   `build-dmg.sh` passes its **path** to `sign_update -f`, so `SPARKLE_PRIVATE_KEY`
+   holds a path, never key material. Generation and every publish happen here and
+   nowhere else — the private key is never copied to another machine, never committed,
+   and never pasted into a config file. Never reuse another app's key either: one
+   compromise would forge updates for every product sharing it, with no way to rotate
+   one without breaking the others.
 2. Copy [`scripts/signing.env.example`](scripts/signing.env.example) to
    `scripts/signing.env` (gitignored) and fill in the signing identity, notary profile,
    and both key values.
 3. Bootstrap an empty, well-formed `appcast.xml` at `downloads/claudeswitch/` in the
    site repo — done, alongside the eight sibling product feeds.
-4. Verify `SUPublicEDKey` and `SUFeedURL` in the **installed** app, then set
+4. Verify `SUPublicEDKey` and `SUFeedURL` in the **shipping bundle** — build once
+   without `--publish` and read them back out of `build.noindex/ClaudeSwitch.app`,
+   confirming the key matches the keychain and the feed is ClaudeSwitch's own. Then set
    `CLAUDESWITCH_SPARKLE_READY=1` in `signing.env` to unlock `--publish`.
 
 ## Using it
