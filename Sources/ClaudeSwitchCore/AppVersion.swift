@@ -8,6 +8,6 @@
 // Settings needs both values at compile time, which is the only reason this file
 // exists. It decides nothing.
 public enum AppVersion {
-    public static let marketing = "1.0.1"
-    public static let build = "4"
+    public static let marketing = "1.0.2"
+    public static let build = "5"
 }
