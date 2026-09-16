@@ -246,4 +246,44 @@ struct LiveDestinationTests {
         print("CLI via TLS (keychain trust only): \(reply.debugDescription) models=\(models)")
         #expect(reply.localizedCaseInsensitiveContains("pong"))
     }
+
+    /// The trust pipeline against a real gateway, whichever side of trusted it is on.
+    ///
+    ///     CLAUDESWITCH_LIVE=1 CLAUDESWITCH_LIVE_TLS_URL=https://host:4443 swift test --filter Live
+    ///
+    /// Untrusted is not a failure here — it is the case worth exercising, because it is the one
+    /// a new user meets. What must hold is that the fetched anchor is a real CA that signed the
+    /// certificate we actually saw, and that the fingerprint gate accepts only the right digits.
+    @Test("TLS trust: check, fetch the CA, and validate it against the leaf we saw")
+    func tlsTrustPipeline() async throws {
+        let base = try #require(Self.env["CLAUDESWITCH_LIVE_TLS_URL"])
+        let status = await TLSTrust.check(baseURL: base)
+
+        switch status {
+        case .trusted:
+            print("TLS: already trusted — nothing for the sheet to do.")
+        case let .untrusted(leaf, issuer):
+            print("TLS: untrusted, issued by \(issuer ?? "an unnamed CA")")
+            let leafDER = try #require(leaf, "an untrusted result must still carry the leaf")
+            #expect(!TLSTrust.isCertificateAuthority(leafDER), "a server leaf is not a CA")
+
+            let candidate = try #require(await TLSTrust.fetchCandidateAnchor(baseURL: base, leaf: leafDER),
+                                         "no anchor served at any candidate path")
+            // The three properties the sheet relies on before showing a fingerprint at all.
+            #expect(TLSTrust.isCertificateAuthority(candidate))
+            #expect(TLSTrust.anchor(candidate, verifies: leafDER))
+            #expect(candidate != leafDER)
+
+            let summary = TLSTrust.summarize(candidate)
+            print("TLS: anchor \(summary.subject) — SHA-256 \(summary.sha256)")
+            #expect(!summary.isExpired)
+            #expect(TLSTrust.confirms(TLSTrust.lastFourPairs(of: summary.sha256),
+                                      matches: summary.sha256))
+            #expect(!TLSTrust.confirms("00000000", matches: summary.sha256))
+        case .notTLS:
+            Issue.record("CLAUDESWITCH_LIVE_TLS_URL is not an https URL.")
+        case let .unreachable(message):
+            Issue.record("Unreachable: \(message)")
+        }
+    }
 }

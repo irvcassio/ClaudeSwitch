@@ -186,6 +186,9 @@ private struct ProfileEditor: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
+            // Says nothing unless the certificate is actually untrusted — see `TrustRow`.
+            TrustRow(baseURL: draft.baseURL, fingerprint: $draft.caAnchorFingerprint)
+
             if draft.provider.requiresKey {
                 SecureField("Key", text: $key, prompt: Text("sk-…"))
                     .autocorrectionDisabled()

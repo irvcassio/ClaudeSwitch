@@ -21,6 +21,10 @@ public struct ClaudeSettingsStore {
         "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
         "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",
+        // Not an ANTHROPIC_/CLAUDE_CODE_ key, but owned the same way: it is written only for a
+        // destination behind a private CA, and removed with the rest on the way back. Node reads
+        // it; the keychain it does not. See `TLSTrust`.
+        "NODE_EXTRA_CA_CERTS",
     ]
 
     /// Top-level settings that outrank the managed `env` block: `model` beats `ANTHROPIC_MODEL`,

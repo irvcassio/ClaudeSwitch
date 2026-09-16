@@ -34,6 +34,11 @@ public struct Profile: Codable, Identifiable, Hashable {
     /// Route through ClaudeSwitch's loopback compatibility relay on this port. 0 means Claude Code
     /// talks to `baseURL` directly. See `CompatibilityRelay`.
     public var relayPort: Int
+    /// The SHA-256 of the private CA this destination's certificate chains to, when the user has
+    /// trusted one. Recorded so the destination can say *which* anchor it needs, and so
+    /// `NODE_EXTRA_CA_CERTS` is written only for destinations that actually need it. See
+    /// `TLSTrust`.
+    public var caAnchorFingerprint: String?
 
     public static let effortLevels = ["low", "medium", "high", "xhigh", "max"]
     /// Values Qwen3.8 will actually accept. `high` and `max` 500 on the first turn.
@@ -43,7 +48,8 @@ public struct Profile: Codable, Identifiable, Hashable {
                 haikuModel: String, sonnetModel: String, opusModel: String, effortLevel: String,
                 contextWindow: Int, maxOutputTokens: Int, modelLength: Int = 0,
                 disableNonessentialTraffic: Bool, enableGatewayModelDiscovery: Bool,
-                switchesDesktop: Bool = false, relayPort: Int = 0) {
+                switchesDesktop: Bool = false, relayPort: Int = 0,
+                caAnchorFingerprint: String? = nil) {
         self.id = id
         self.name = name
         self.provider = provider
@@ -60,6 +66,7 @@ public struct Profile: Codable, Identifiable, Hashable {
         self.enableGatewayModelDiscovery = enableGatewayModelDiscovery
         self.switchesDesktop = switchesDesktop
         self.relayPort = relayPort
+        self.caAnchorFingerprint = caAnchorFingerprint
     }
 
     /// The first port the relay offers. Chosen from the dynamic range, away from anything the
@@ -128,6 +135,12 @@ public struct Profile: Codable, Identifiable, Hashable {
         if enableGatewayModelDiscovery {
             env.append(("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY", "1"))
         }
+        // Claude Code runs on Node, which ignores the macOS keychain — so trusting the gateway's
+        // CA there fixes the desktop app and leaves the CLI failing with
+        // UNABLE_TO_VERIFY_LEAF_SIGNATURE. This is the only thing that reaches Node. See `TLSTrust`.
+        if caAnchorFingerprint != nil {
+            env.append(("NODE_EXTRA_CA_CERTS", TLSTrust.bundlePath.path(percentEncoded: false)))
+        }
         return env
     }
 
@@ -159,6 +172,7 @@ public struct Profile: Codable, Identifiable, Hashable {
         enableGatewayModelDiscovery = try c.decode(Bool.self, forKey: .enableGatewayModelDiscovery)
         switchesDesktop = try c.decodeIfPresent(Bool.self, forKey: .switchesDesktop) ?? false
         relayPort = try c.decodeIfPresent(Int.self, forKey: .relayPort) ?? 0
+        caAnchorFingerprint = try c.decodeIfPresent(String.self, forKey: .caAnchorFingerprint)
     }
 }
 

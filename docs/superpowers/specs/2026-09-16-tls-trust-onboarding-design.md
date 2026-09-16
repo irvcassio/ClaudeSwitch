@@ -7,7 +7,7 @@
 
 A first-time user points ClaudeSwitch at an internal HTTPS gateway and gets:
 
-> Cannot reach the server at https://10.80.114.11:4443: the server's TLS certificate is not
+> Cannot reach the server at https://192.0.2.10:4443: the server's TLS certificate is not
 > trusted on this Mac. Add the CA that signed it to your login keychain — `security
 > add-trusted-cert -r trustRoot -p ssl -k ~/Library/Keychains/login.keychain-db <ca.crt>` —
 > after checking its fingerprint with the server's administrator. Claude Code and Claude
@@ -19,7 +19,7 @@ fingerprint, and run a `security` command. Three manual steps, and the last sent
 ## The finding that reframes it
 
 **Claude Code does not read the macOS keychain.** Measured on 2026-09-16 against
-`https://10.80.114.11:4443`, with Node v26.5.0 (what Claude Code runs on):
+`https://192.0.2.10:4443`, with Node v26.5.0 (what Claude Code runs on):
 
 | Consumer | TLS stack | Reads macOS keychain? |
 |---|---|---|
@@ -83,12 +83,24 @@ Trying several is safe rather than noisy *because* of the validation below: a ca
 not parse, or parses but does not verify the leaf, is discarded before the user is ever shown a
 fingerprint to confirm. A wrong hit cannot become a trusted anchor.
 
-It then runs **one** validation that subsumes three questions: build a trust evaluation for the
-captured leaf with the candidate as the *only* anchor (`SecTrustSetAnchorCertificatesOnly(true)`,
-basic X509 policy, no hostname check — the real connection verifies that later). If it evaluates
-clean, the candidate is a usable anchor *and* is the one that signed this server *and* chains
-correctly. A `CA:FALSE` self-signed server certificate fails here, which is the documented reason
-keyportal's own certificate could not be used as an anchor.
+It then validates the candidate. The original design claimed a single trust evaluation would
+answer every question; **implementation disproved that**, and the correction matters:
+
+> `SecTrust` trusts any certificate present in the anchor list without further checks. Passing a
+> server's own leaf as its own anchor evaluates **clean**, `CA:TRUE` is **not** enforced, and a
+> server misconfigured to serve `server.crt` at `/ca.crt` would sail straight through.
+
+Node *does* enforce `CA:TRUE` — which is the documented reason keyportal's self-signed server
+certificate could not be used as an anchor. So accepting one here would leave ClaudeSwitch and
+the desktop green while Claude Code kept refusing the gateway: the exact false-green this work
+exists to prevent. Three explicit checks, therefore:
+
+1. the candidate is **not** the leaf itself
+2. it carries `basicConstraints` with `CA:TRUE`, read out of the DER directly —
+   `SecCertificateCopyValues` renders this extension as *localised display strings*, which is no
+   basis for a security decision
+3. it verifies the captured leaf as the only anchor (`SecTrustSetAnchorCertificatesOnly(true)`,
+   basic X509 policy, no hostname check — the real connection verifies that later)
 
 Then the gate: subject, issuer, validity and the full SHA-256 in hex groups, plus a field
 requiring the **last four pairs typed by hand** (`04D06226` for aiserver). Case-insensitive,
@@ -145,10 +157,12 @@ strings.
 - **new** `Sources/ClaudeSwitchCore/Services/TLSTrust.swift`
 - **new** `Sources/ClaudeSwitch/UI/TrustSheet.swift` — its own file; `SettingsWindow.swift` is
   already 737 lines and should not grow
-- `Warning` gains an optional `remedy` so a warning can carry an action (3 call sites)
 - `ClaudeSettingsStore.managedKeys` += `NODE_EXTRA_CA_CERTS`; `EnvironmentReport` shows it with
   reach `.both`
 - `Profile` += `caAnchorFingerprint`
+
+`Warning` was to gain an optional `remedy` carrying an action. Dropped: the proactive TLS row is
+its own view with its own button, so a warning never needs to carry one. Warnings stay text.
 
 ## Out of scope, deliberately
 

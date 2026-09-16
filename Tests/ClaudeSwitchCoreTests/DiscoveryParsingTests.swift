@@ -104,12 +104,16 @@ struct DiscoveryParsingTests {
 
 @Suite("HTTP errors")
 struct HTTPErrorTests {
-    @Test("An untrusted certificate says how to fix it")
+    @Test("An untrusted certificate says how to fix it, for both consumers")
     func untrustedCertificate() {
         let error = NSError(domain: NSURLErrorDomain, code: NSURLErrorServerCertificateUntrusted)
         let message = HTTPClient.describe(error)
         #expect(message.contains("not trusted on this Mac"))
-        #expect(message.contains("add-trusted-cert"))
+        // Claude Code runs on Node, which ignores the keychain. The message used to claim the two
+        // shared a trust store, which left anyone who followed it exactly with a working desktop
+        // and a still-broken CLI.
+        #expect(message.contains("NODE_EXTRA_CA_CERTS"))
+        #expect(!message.contains("same trust store"))
     }
 
     @Test("Other errors keep their own description")
@@ -118,7 +122,9 @@ struct HTTPErrorTests {
         #expect(HTTPClient.describe(error) == error.localizedDescription)
     }
 
-    /// What nginx on aiserver's :4443 answered on 2026-09-16 to `http://10.80.114.11:4443/v1/models`.
+    /// What nginx answers when an https port is asked for in plain http — observed on a real
+    /// TLS-terminating gateway on 2026-09-16. The address here is a placeholder: this repository
+    /// names nobody's network.
     static let plainHTTPToTLSPort = """
     <html>
     <head><title>400 The plain HTTP request was sent to HTTPS port</title></head>
@@ -132,21 +138,21 @@ struct HTTPErrorTests {
 
     @Test("A TLS port asked for in plain HTTP names the scheme, not the model id")
     func plainHTTPAgainstTLSPort() {
-        let client = HTTPClient(base: URL(string: "http://10.80.114.11:4443")!, token: "k", timeout: 1)
+        let client = HTTPClient(base: URL(string: "http://192.0.2.10:4443")!, token: "k", timeout: 1)
         let warning = DestinationDiscovery.schemeMismatch(client, code: 400,
                                                           body: Data(Self.plainHTTPToTLSPort.utf8))
         #expect(warning?.severity == .blocking)
-        #expect(warning?.message.contains("https://10.80.114.11:4443") == true)
+        #expect(warning?.message.contains("https://192.0.2.10:4443") == true)
         #expect(warning?.message.contains("model id is not the problem") == true)
     }
 
     @Test("An unrelated 400, or one already on https, keeps the generic advice")
     func otherBadRequests() {
-        let plain = HTTPClient(base: URL(string: "http://10.80.114.11:4000")!, token: "k", timeout: 1)
+        let plain = HTTPClient(base: URL(string: "http://192.0.2.10:4000")!, token: "k", timeout: 1)
         #expect(DestinationDiscovery.schemeMismatch(plain, code: 400,
                                                     body: Data(#"{"error":"bad model"}"#.utf8)) == nil)
         // Already https: whatever the 400 is, the scheme is not it.
-        let secure = HTTPClient(base: URL(string: "https://10.80.114.11:4443")!, token: "k", timeout: 1)
+        let secure = HTTPClient(base: URL(string: "https://192.0.2.10:4443")!, token: "k", timeout: 1)
         #expect(DestinationDiscovery.schemeMismatch(secure, code: 400,
                                                     body: Data(Self.plainHTTPToTLSPort.utf8)) == nil)
         // Only a 400 carries this body.

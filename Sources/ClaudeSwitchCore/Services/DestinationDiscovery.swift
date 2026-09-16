@@ -443,9 +443,11 @@ struct HTTPClient {
         guard nsError.domain == NSURLErrorDomain, trustCodes.contains(nsError.code) else {
             return error.localizedDescription
         }
-        return "the server's TLS certificate is not trusted on this Mac. Add the CA that signed it "
-            + "to your login keychain — `security add-trusted-cert -r trustRoot -p ssl -k "
-            + "~/Library/Keychains/login.keychain-db <ca.crt>` — after checking its fingerprint "
-            + "with the server's administrator. Claude Code and Claude Desktop use the same trust store."
+        return "the server's TLS certificate is not trusted on this Mac. Use “Fix…” beside the "
+            + "base URL to install the CA that signed it, after checking its fingerprint with the "
+            + "server's administrator. Two things need it and they do not share a trust store: "
+            + "Claude Desktop reads the login keychain, while Claude Code runs on Node and reads "
+            + "only NODE_EXTRA_CA_CERTS — so trusting the CA by hand fixes the desktop and leaves "
+            + "the CLI failing."
     }
 }
