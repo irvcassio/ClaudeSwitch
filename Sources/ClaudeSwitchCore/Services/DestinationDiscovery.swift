@@ -185,7 +185,8 @@ public enum DestinationDiscovery {
     // MARK: - Measuring
 
     /// The server's ceiling on prompt + output for `model`, read from the refusal of an oversized
-    /// request. nil when the server does not refuse — LM Studio clamps instead — or does not say.
+    /// request. nil when the server does not refuse — LM Studio clamps instead, and so does a
+    /// LiteLLM proxy running aiserver's Claude Code compatibility hook — or does not say.
     public static func measureLength(baseURL: String, token: String?, model: String,
                                      timeout: TimeInterval = 30) async -> Int? {
         guard !neverProbe.contains(model), let base = URL(string: baseURL) else { return nil }
@@ -214,7 +215,12 @@ public enum DestinationDiscovery {
             if let measured = await measureLength(baseURL: baseURL, token: token, model: model) {
                 return measured
             }
-            return listed?.architectureMaximum
+            // Not refused — the server clamps (LM Studio, or a proxy with a compatibility hook).
+            // The published input limit is then the best answer the server gives.
+            if let published = listed?.architectureMaximum { return published }
+            guard listing == nil else { return nil }
+            let fresh = await discover(provider: provider, baseURL: baseURL, token: token)
+            return fresh.models.first { $0.id == model }?.architectureMaximum
         }
     }
 

@@ -52,7 +52,7 @@ struct LiveDestinationTests {
         #expect(!listing.models.contains { $0.id == "triage-agent" && $0.isSelectable })
 
         let modelID = try #require(Self.env["CLAUDESWITCH_LIVE_LITELLM_MODEL"] ?? listing.selectableModels.first?.id)
-        let measured = try #require(await DestinationDiscovery.measureLength(baseURL: base, token: key, model: modelID))
+        let measured = try #require(await DestinationDiscovery.serverLength(provider: .liteLLM, baseURL: base, token: key, model: modelID))
         print("LiteLLM: \(modelID) measured at \(measured)")
 
         var profile = Profile.blank(name: "Live LiteLLM", provider: .liteLLM)
@@ -137,7 +137,7 @@ struct LiveDestinationTests {
         var profile = Profile.blank(name: "Live LiteLLM", provider: .liteLLM)
         profile.baseURL = base
         for keyPath in [\Profile.model, \.haikuModel, \.sonnetModel, \.opusModel] { profile[keyPath: keyPath] = modelID }
-        let measured = try #require(await DestinationDiscovery.measureLength(baseURL: base, token: key, model: modelID))
+        let measured = try #require(await DestinationDiscovery.serverLength(provider: .liteLLM, baseURL: base, token: key, model: modelID))
         profile.adopt(LimitPlan.plan(modelLength: measured))
 
         let (reply, models) = try cliReply(profile: profile, token: key)
@@ -164,12 +164,12 @@ struct LiveDestinationTests {
         profile.baseURL = base
         profile.relayPort = relayPort
         for keyPath in [\Profile.model, \.haikuModel, \.sonnetModel, \.opusModel] { profile[keyPath: keyPath] = modelID }
-        let measured = try #require(await DestinationDiscovery.measureLength(baseURL: base, token: key, model: modelID))
+        let measured = try #require(await DestinationDiscovery.serverLength(provider: .liteLLM, baseURL: base, token: key, model: modelID))
         profile.adopt(LimitPlan.plan(modelLength: measured))
         return (profile, key)
     }
 
-    @Test("Relay: the proxy passes every check, including the request shape, through the relay",
+    @Test("Relay: the proxy passes every check through the relay, fixed server or not",
           .enabled(if: env["CLAUDESWITCH_LIVE_LITELLM_URL"] != nil))
     func relayProbe() async throws {
         let port = Int.random(in: 48_000...48_900)
@@ -182,8 +182,13 @@ struct LiveDestinationTests {
         direct.relayPort = 0
         let without = await GatewayProbe.run(profile: direct, authToken: key)
         print("direct:"); report(without)
-        #expect(without.midConversationSystemOK == false)
-        #expect(!without.isHealthy)
+        // A proxy with aiserver's compatibility hook takes the shape directly; one without it
+        // does not, and must then be unhealthy. The relay has to work either way.
+        if without.midConversationSystemOK == false {
+            #expect(!without.isHealthy)
+        } else {
+            #expect(without.isHealthy)
+        }
 
         let with = await GatewayProbe.run(profile: profile, authToken: key)
         print("relayed:"); report(with)

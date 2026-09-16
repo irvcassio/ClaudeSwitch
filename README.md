@@ -48,7 +48,10 @@ passing requests through to it — rejects them, and every turn fails. With the 
 Claude Code talks to ClaudeSwitch on `127.0.0.1`, which folds those messages into the user turn
 (what Claude Code itself falls back to) and streams everything else through untouched. New
 LiteLLM destinations start with it on; the probe's *Request shape* check says when the server
-no longer needs it. ClaudeSwitch must be running while relayed sessions are in use.
+no longer needs it — a LiteLLM proxy running the compatibility hook from
+[`aiserver-config`](https://github.com/irvcassio/aiserver-config) takes Claude Code's requests
+directly. The desktop still needs the relay for such a proxy while it is plain HTTP on the
+network. ClaudeSwitch must be running while relayed sessions are in use.
 
 ## Install
 
