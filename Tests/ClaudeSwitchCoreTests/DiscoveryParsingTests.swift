@@ -117,4 +117,40 @@ struct HTTPErrorTests {
         let error = NSError(domain: NSURLErrorDomain, code: NSURLErrorCannotConnectToHost)
         #expect(HTTPClient.describe(error) == error.localizedDescription)
     }
+
+    /// What nginx on aiserver's :4443 answered on 2026-09-16 to `http://10.80.114.11:4443/v1/models`.
+    static let plainHTTPToTLSPort = """
+    <html>
+    <head><title>400 The plain HTTP request was sent to HTTPS port</title></head>
+    <body>
+    <center><h1>400 Bad Request</h1></center>
+    <center>The plain HTTP request was sent to HTTPS port</center>
+    <hr><center>nginx</center>
+    </body>
+    </html>
+    """
+
+    @Test("A TLS port asked for in plain HTTP names the scheme, not the model id")
+    func plainHTTPAgainstTLSPort() {
+        let client = HTTPClient(base: URL(string: "http://10.80.114.11:4443")!, token: "k", timeout: 1)
+        let warning = DestinationDiscovery.schemeMismatch(client, code: 400,
+                                                          body: Data(Self.plainHTTPToTLSPort.utf8))
+        #expect(warning?.severity == .blocking)
+        #expect(warning?.message.contains("https://10.80.114.11:4443") == true)
+        #expect(warning?.message.contains("model id is not the problem") == true)
+    }
+
+    @Test("An unrelated 400, or one already on https, keeps the generic advice")
+    func otherBadRequests() {
+        let plain = HTTPClient(base: URL(string: "http://10.80.114.11:4000")!, token: "k", timeout: 1)
+        #expect(DestinationDiscovery.schemeMismatch(plain, code: 400,
+                                                    body: Data(#"{"error":"bad model"}"#.utf8)) == nil)
+        // Already https: whatever the 400 is, the scheme is not it.
+        let secure = HTTPClient(base: URL(string: "https://10.80.114.11:4443")!, token: "k", timeout: 1)
+        #expect(DestinationDiscovery.schemeMismatch(secure, code: 400,
+                                                    body: Data(Self.plainHTTPToTLSPort.utf8)) == nil)
+        // Only a 400 carries this body.
+        #expect(DestinationDiscovery.schemeMismatch(plain, code: 502,
+                                                    body: Data(Self.plainHTTPToTLSPort.utf8)) == nil)
+    }
 }

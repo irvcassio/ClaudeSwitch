@@ -174,7 +174,10 @@ public enum DestinationDiscovery {
         case .success(401, _):
             return Result(findings: [Warning(severity: .blocking, message:
                 "401 — the key is missing, wrong, or expired.")])
-        case .success(let code, _):
+        case .success(let code, let data):
+            if let scheme = schemeMismatch(client, code: code, body: data) {
+                return Result(findings: [scheme])
+            }
             return Result(findings: [Warning(severity: .blocking, message:
                 "/v1/models returned HTTP \(code). Enter the model id by hand if this server does not list models.")])
         case .failure(let message):
@@ -350,6 +353,24 @@ public enum DestinationDiscovery {
             return value
         }
         return nil
+    }
+
+    /// A TLS port asked for in plain `http://`. nginx answers this with a 400 whose body says so,
+    /// and the generic "enter the model id by hand" advice is actively wrong here: the id is fine,
+    /// the scheme is not, and every turn would fail the same way after typing one in.
+    static func schemeMismatch(_ client: HTTPClient, code: Int, body: Data) -> Warning? {
+        guard code == 400, client.base.scheme?.lowercased() == "http" else { return nil }
+        let text = String(decoding: body, as: UTF8.self).lowercased()
+        guard text.contains("plain http request was sent to https port")
+                || text.contains("http request was sent to https port")
+        else { return nil }
+        var https = URLComponents(url: client.base, resolvingAgainstBaseURL: false)
+        https?.scheme = "https"
+        let corrected = https?.string ?? client.base.absoluteString
+        return Warning(severity: .blocking, message:
+            "This port speaks HTTPS, and the Base URL asks for it in plain HTTP — that is what the "
+            + "400 means. Use \(corrected) instead. The model id is not the problem; typing one by "
+            + "hand would leave every turn failing the same way.")
     }
 
     private static func unreachable(_ what: String, _ client: HTTPClient, _ message: String) -> Warning {
