@@ -101,3 +101,20 @@ struct DiscoveryParsingTests {
                                                          token: "x", model: "triage-agent") == nil)
     }
 }
+
+@Suite("HTTP errors")
+struct HTTPErrorTests {
+    @Test("An untrusted certificate says how to fix it")
+    func untrustedCertificate() {
+        let error = NSError(domain: NSURLErrorDomain, code: NSURLErrorServerCertificateUntrusted)
+        let message = HTTPClient.describe(error)
+        #expect(message.contains("not trusted on this Mac"))
+        #expect(message.contains("add-trusted-cert"))
+    }
+
+    @Test("Other errors keep their own description")
+    func otherErrors() {
+        let error = NSError(domain: NSURLErrorDomain, code: NSURLErrorCannotConnectToHost)
+        #expect(HTTPClient.describe(error) == error.localizedDescription)
+    }
+}

@@ -211,4 +211,39 @@ struct LiveDestinationTests {
         #expect(reply.localizedCaseInsensitiveContains("pong"))
         #expect(models == [profile.model])
     }
+
+    // MARK: - Over TLS
+
+    /// A LiteLLM proxy behind HTTPS with a private CA, relying on the macOS trust store alone —
+    /// no certificate file is handed to anything. Run once before trusting the CA (it must fail
+    /// with the trust message) and once after (it must pass end to end).
+    @Test("TLS: the proxy over HTTPS, trusted through the macOS keychain only",
+          .enabled(if: env["CLAUDESWITCH_LIVE_LITELLM_TLS_URL"] != nil))
+    func liteLLMOverTLS() async throws {
+        let base = try #require(Self.env["CLAUDESWITCH_LIVE_LITELLM_TLS_URL"])
+        let key = try #require(Self.env["CLAUDESWITCH_LIVE_LITELLM_KEY"])
+        let modelID = try #require(Self.env["CLAUDESWITCH_LIVE_LITELLM_MODEL"])
+        var profile = Profile.blank(name: "Live LiteLLM over TLS", provider: .liteLLM)
+        profile.baseURL = base
+        for keyPath in [\Profile.model, \.haikuModel, \.sonnetModel, \.opusModel] { profile[keyPath: keyPath] = modelID }
+        // HTTPS on the network is what the desktop accepts without a relay.
+        profile.switchesDesktop = true
+        #expect(DesktopGatewayStore.ineligibility(of: profile) == nil)
+
+        let listing = await DestinationDiscovery.discover(provider: .liteLLM, baseURL: base, token: key)
+        if let failure = listing.findings.first(where: { $0.message.contains("not trusted on this Mac") }) {
+            print("TLS: CA not trusted yet — \(failure.message)")
+            Issue.record("The CA is not trusted on this Mac yet.")
+            return
+        }
+        let length = try #require(await DestinationDiscovery.serverLength(provider: .liteLLM, baseURL: base, token: key, model: modelID, listing: listing))
+        profile.adopt(LimitPlan.plan(modelLength: length))
+        let result = await GatewayProbe.run(profile: profile, authToken: key)
+        report(result)
+        #expect(result.isHealthy)
+
+        let (reply, models) = try cliReply(profile: profile, token: key)
+        print("CLI via TLS (keychain trust only): \(reply.debugDescription) models=\(models)")
+        #expect(reply.localizedCaseInsensitiveContains("pong"))
+    }
 }

@@ -51,7 +51,8 @@ LiteLLM destinations start with it on; the probe's *Request shape* check says wh
 no longer needs it — a LiteLLM proxy running the compatibility hook from
 [`aiserver-config`](https://github.com/irvcassio/aiserver-config) takes Claude Code's requests
 directly. The desktop still needs the relay for such a proxy while it is plain HTTP on the
-network. ClaudeSwitch must be running while relayed sessions are in use.
+network — or give the proxy HTTPS and trust its CA in the login keychain, which ClaudeSwitch,
+the CLI and the desktop all read; ClaudeSwitch names that fix when a certificate is refused. ClaudeSwitch must be running while relayed sessions are in use.
 
 ## Install
 

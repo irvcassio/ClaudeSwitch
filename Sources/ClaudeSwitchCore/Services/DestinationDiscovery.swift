@@ -406,7 +406,25 @@ struct HTTPClient {
             let (data, response) = try await session.data(for: request)
             return .success((response as? HTTPURLResponse)?.statusCode ?? 0, data)
         } catch {
-            return .failure(error.localizedDescription)
+            return .failure(Self.describe(error))
         }
+    }
+
+    /// Certificate failures get a message that says what to do. A private gateway usually has
+    /// its own CA, and both ClaudeSwitch and Claude Code read the macOS trust store.
+    static func describe(_ error: Error) -> String {
+        let trustCodes: Set<Int> = [
+            NSURLErrorServerCertificateUntrusted, NSURLErrorServerCertificateHasUnknownRoot,
+            NSURLErrorServerCertificateHasBadDate, NSURLErrorServerCertificateNotYetValid,
+            NSURLErrorSecureConnectionFailed,
+        ]
+        let nsError = error as NSError
+        guard nsError.domain == NSURLErrorDomain, trustCodes.contains(nsError.code) else {
+            return error.localizedDescription
+        }
+        return "the server's TLS certificate is not trusted on this Mac. Add the CA that signed it "
+            + "to your login keychain — `security add-trusted-cert -r trustRoot -p ssl -k "
+            + "~/Library/Keychains/login.keychain-db <ca.crt>` — after checking its fingerprint "
+            + "with the server's administrator. Claude Code and Claude Desktop use the same trust store."
     }
 }
