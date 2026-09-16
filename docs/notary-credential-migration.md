@@ -1,9 +1,31 @@
-# Notary credential: set up `notary-8B3CHTY93V` and retire the borrowed `hivematrix`
+# Move ClaudeSwitch releases to the build machine, and retire the borrowed `hivematrix`
 
-**Written 2026-09-16 on the ClaudeSwitch Mac. Run the steps below on the machine that
-holds the working notary credential (the Doppo/HiveMatrix build machine).**
+**Written 2026-09-16. Run everything below on the build machine — the Mac that holds the working
+notary credential and builds the Doppo products and HiveMatrix.**
 
 Paste the "Prompt" section into Claude Code on that machine, or just follow it by hand.
+
+## Decision: ClaudeSwitch is built and published only on the build machine
+
+Every ClaudeSwitch build, signature, notarization and publish happens there. The Mac used for
+development does not hold a Sparkle key or a `scripts/signing.env`, so it *cannot* publish —
+`--publish` refuses outright, which is the intended guard. Local unsigned dev builds still work
+there with no configuration.
+
+This follows `VERSION`'s own rule, which this repo already states:
+
+> keypair generation and every `--publish` happen on the build machine only
+
+A Sparkle keypair **was** generated on the development Mac on 2026-09-16, which was a mistake —
+wrong machine. It has since been destroyed there: the login-keychain item
+(`account claudeswitch`, service `https://sparkle-project.org`) was deleted, and the exported
+private key was shredded with `rm -P`. Nothing was lost, because **no ClaudeSwitch build has ever
+been published** — no GitHub release, no appcast, and no `SUPublicEDKey` in any user's hands — so
+no installed copy depends on that key.
+
+> **The public key `JrURGRKjzfZNiPXLIkdtW3TuOIHu42X+Yx06qPevN3M=` is void.** It appears in earlier
+> commit messages and in the repo history. Ignore it. A new keypair is generated in step 3 below,
+> and its public half is the only one that matters.
 
 ---
 
@@ -51,8 +73,9 @@ account-scoped profile, `notary-8B3CHTY93V`, referenced by every app signed unde
 
 ## Prompt
 
-> I need to replace an expired notarization credential and retire a profile name that several
-> Mac apps borrowed from each other.
+> I need to (a) replace an expired notarization credential, (b) retire a profile name that
+> several Mac apps borrowed from each other, and (c) make this machine the only place
+> ClaudeSwitch is ever built and published.
 >
 > Facts already established (do not re-derive):
 > - The Mac apps are signed by `Developer ID Application: Irven Cassio (8B3CHTY93V)`, an
@@ -91,6 +114,43 @@ account-scoped profile, `notary-8B3CHTY93V`, referenced by every app signed unde
 > Verify with `xcrun notarytool history --keychain-profile notary-8B3CHTY93V`. It must return
 > without a 401 before continuing.
 >
+> **3b. Generate ClaudeSwitch's Sparkle keypair HERE.** Clone the repo if it is not already on
+> this machine (`git clone https://github.com/irvcassio/ClaudeSwitch.git ~/ClaudeSwitch`), then
+> `swift build` once so Sparkle's tools are fetched, and run:
+>
+>     .build/artifacts/sparkle/Sparkle/bin/generate_keys --account claudeswitch
+>
+> Confirm first that no key already exists for that account
+> (`generate_keys --account claudeswitch -p` should error). Do **not** import the key from the
+> development Mac — it was destroyed there on purpose, and a key that never leaves the machine
+> that uses it is the point. Export a backup and lock it down:
+>
+>     mkdir -p ~/.doppo-signing && chmod 700 ~/.doppo-signing
+>     .build/artifacts/sparkle/Sparkle/bin/generate_keys --account claudeswitch \
+>       -x ~/.doppo-signing/claudeswitch-sparkle-ed25519.key
+>     chmod 600 ~/.doppo-signing/claudeswitch-sparkle-ed25519.key
+>
+> Then write `~/ClaudeSwitch/scripts/signing.env` (gitignored — verify with
+> `git check-ignore -v scripts/signing.env` and never commit it):
+>
+>     BUNDLE_ID="com.irvcassio.ClaudeSwitch"
+>     TEAM_ID="8B3CHTY93V"
+>     SIGN_IDENTITY="Developer ID Application: Irven Cassio (8B3CHTY93V)"
+>     NOTARY_PROFILE="notary-8B3CHTY93V"
+>     NOTARY_TEAM_ID="8B3CHTY93V"
+>     SPARKLE_PRIVATE_KEY="$HOME/.doppo-signing/claudeswitch-sparkle-ed25519.key"
+>     SPARKLE_PUBLIC_KEY="<the public key generate_keys just printed>"
+>     CLAUDESWITCH_SPARKLE_READY=1
+>
+> `chmod 600` it. Check `security find-identity -v -p codesigning` lists
+> `Developer ID Application: Irven Cassio (8B3CHTY93V)` on this machine — if it does not, the
+> certificate and its private key need to be installed here before anything can be signed, and
+> that is a separate task. Report it rather than working around it.
+>
+> `CLAUDESWITCH_SPARKLE_READY=1` asserts two things; verify both before setting it: the keypair
+> was generated for *this* product (it was, in this step), and `FEED_URL` resolves to
+> ClaudeSwitch's own feed — `https://www.doppoworks.com/downloads/claudeswitch/appcast.xml`.
+>
 > **4. Audit every Mac app on this machine for the borrowed name.** Find each one and report
 > the list before editing anything:
 >
@@ -112,39 +172,34 @@ account-scoped profile, `notary-8B3CHTY93V`, referenced by every app signed unde
 > - Leave `hivematrix` stored in the keychain for now. Delete it only once every product has
 >   notarized successfully under the new name.
 >
-> **6. Report** which products you changed, which still reference the old name, and anything
-> that looked wrong.
+> **6. Publish the ClaudeSwitch beta** once steps 3 and 3b are verified:
 >
-> Do not touch any Sparkle signing key. Those are per-product and unrelated to this task.
+>     cd ~/ClaudeSwitch && git pull && swift test && ./scripts/build-dmg.sh --beta --publish
+>
+> That bumps `BETA` from 1.0.2 to 1.0.3, notarizes, cuts the GitHub release, and commits the
+> appcast to the site repo (`~/doppoworks`, which must be checked out here). It is the first
+> ClaudeSwitch release ever published, so there is no existing feed to be compatible with.
+>
+> **7. Report** which products you changed, which still reference the old name, the new Sparkle
+> public key, and anything that looked wrong.
+>
+> Do not touch any *other* product's Sparkle key — those are per-product identities with shipped
+> installed bases, and regenerating one would break its users' updates. ClaudeSwitch's is the
+> only one being created here, and only because it has never shipped.
 
 ---
 
-## After the credential exists: publishing ClaudeSwitch
+## Standing risks
 
-**Publish ClaudeSwitch from the ClaudeSwitch Mac, not this one.** Its Sparkle private key was
-generated there on 2026-09-16 (login keychain, account `claudeswitch`, plus a mode-600 export at
-`~/.doppo-signing/claudeswitch-sparkle-ed25519.key`). Publishing from a machine without that key
-would sign the update feed with a different key, and installed copies would reject every future
-update.
+**Back up `~/.doppo-signing/claudeswitch-sparkle-ed25519.key`** once it exists on the build
+machine. It is ClaudeSwitch's permanent update-signing identity. If it is lost there is no
+recovery — only telling users to reinstall by hand. The same applies to every other product's
+Sparkle key.
 
-An API key is a portable file, so the simple path is to copy the `.p8` to the ClaudeSwitch Mac
-and store the same profile there:
+**Do not generate a ClaudeSwitch Sparkle key anywhere else again.** After the first publish, the
+public half is baked into every shipped copy, and a second key would be rejected by every install
+that already exists. One key, one machine, from here on.
 
-    xcrun notarytool store-credentials notary-8B3CHTY93V \
-      --key ~/.doppo-signing/AuthKey_XXXXXXXX.p8 --key-id XXXXXXXX
-
-Then, on the ClaudeSwitch Mac:
-
-    cd ~/ClaudeSwitch && ./scripts/build-dmg.sh --beta --publish
-
-That bumps `BETA` to 1.0.3, notarizes, cuts the GitHub release, and pushes the appcast. Already
-in place there: `scripts/signing.env`, the Developer ID identity, the Sparkle keypair
-(`SUPublicEDKey = JrURGRKjzfZNiPXLIkdtW3TuOIHu42X+Yx06qPevN3M=`), and
-`CLAUDESWITCH_SPARKLE_READY=1`. Notarization is the only thing missing.
-
-## Standing risk
-
-**Back up `~/.doppo-signing/claudeswitch-sparkle-ed25519.key`** from the ClaudeSwitch Mac. It is
-now ClaudeSwitch's permanent update-signing identity. If it is lost there is no recovery — only
-telling users to reinstall by hand. The same applies to every other product's Sparkle key on
-whichever machine holds it.
+**The development Mac must stay unable to publish.** It has no `scripts/signing.env` and no
+Sparkle key, so `--publish` refuses. If someone recreates a `signing.env` there to get signed
+local builds, leave the `SPARKLE_*` lines and `CLAUDESWITCH_SPARKLE_READY` out of it.
