@@ -43,7 +43,7 @@ struct ClaudeSettingsStoreTests {
         """
         let store = try makeStore(original)
         try store.apply(profile: Self.fixture(), authToken: "sk-test")
-        #expect(try store.readManagedEnvironment().count == 10)
+        #expect(try store.readManagedEnvironment().count == 11)
 
         try store.clearManagedEnvironment()
         #expect(try String(contentsOf: store.url, encoding: .utf8) == original)

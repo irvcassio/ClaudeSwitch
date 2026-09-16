@@ -1,0 +1,103 @@
+import Foundation
+import Testing
+@testable import ClaudeSwitchCore
+
+/// Each fixture is a trimmed copy of what the real server returned on 2026-09-16.
+@Suite("Destination discovery parsing")
+struct DiscoveryParsingTests {
+    static let lmStudio = """
+    {"data":[
+      {"id":"qwen36-mlx8","type":"vlm","state":"loaded","max_context_length":262144,"loaded_context_length":262144,"arch":"qwen3_5_moe","quantization":"8bit"},
+      {"id":"qwen3.6-35b-a3b","type":"vlm","state":"not-loaded","max_context_length":262144,"arch":"qwen3_5_moe","quantization":"8bit"},
+      {"id":"text-embedding-nomic-embed-text-v1.5","type":"embeddings","state":"not-loaded","max_context_length":2048}
+    ],"object":"list"}
+    """
+
+    @Test("LM Studio: only the loaded instance is selectable, at its loaded length")
+    func lmStudioLoadedInstance() {
+        let models = DestinationDiscovery.parseLMStudio(Data(Self.lmStudio.utf8))
+        #expect(models.count == 3)
+        let selectable = models.filter(\.isSelectable)
+        #expect(selectable.map(\.id) == ["qwen36-mlx8"])
+        #expect(selectable.first?.contextLength == 262_144)
+
+        // Same weights, not loaded: picking it would load a second 38 GB copy.
+        let unloaded = models.first { $0.id == "qwen3.6-35b-a3b" }
+        #expect(unloaded?.isLoaded == false)
+        #expect(unloaded?.isSelectable == false)
+        #expect(unloaded?.contextLength == nil)
+
+        #expect(models.first { $0.id.contains("embed") }?.isChatModel == false)
+        // Selectable models sort first, so the picker opens on something usable.
+        #expect(models.first?.id == "qwen36-mlx8")
+    }
+
+    @Test("LM Studio: a model loaded at less than its maximum reports the loaded length")
+    func lmStudioReducedContext() {
+        let json = #"{"data":[{"id":"m","type":"llm","state":"loaded","max_context_length":262144,"loaded_context_length":131072}]}"#
+        #expect(DestinationDiscovery.parseLMStudio(Data(json.utf8)).first?.contextLength == 131_072)
+    }
+
+    static let liteLLMInfo = """
+    {"data":[
+      {"model_name":"qwen38-claude","litellm_params":{"model":"openai/Qwen/Qwen3.8-27B-FP8"},"model_info":{"max_tokens":null,"max_input_tokens":262144,"max_output_tokens":null}},
+      {"model_name":"qwen3-embedding","litellm_params":{"model":"openai/qwen3-embedding"},"model_info":{"max_input_tokens":8192,"mode":"embedding"}},
+      {"model_name":"triage-agent","litellm_params":{"model":"openai/triage-agent"},"model_info":{}}
+    ]}
+    """
+
+    @Test("LiteLLM: reads the input limit and spots embeddings")
+    func liteLLMInfo() {
+        let info = DestinationDiscovery.parseLiteLLMInfo(Data(Self.liteLLMInfo.utf8))
+        #expect(info["qwen38-claude"]?.maxInput == 262_144)
+        #expect(info["qwen38-claude"]?.maxOutput == nil)
+        #expect(info["qwen3-embedding"]?.isEmbedding == true)
+        #expect(info["triage-agent"] != nil)
+    }
+
+    @Test("Reads the ceiling out of the refusals vLLM gives through LiteLLM")
+    func lengthFromRefusal() {
+        // max_tokens above the model length.
+        let tooMuchOutput = #"{"error":{"message":"litellm.InternalServerError: InternalServerError: OpenAIException - {\"type\":\"error\",\"error\":{\"type\":\"internal_error\",\"message\":\"max_completion_tokens=300000 cannot be greater than max_model_len=max_total_tokens=262144. Please request fewer output tokens.\"}}","code":"500"}}"#
+        // max_tokens equal to the model length, so prompt + output overflows.
+        let overflow = #"{"error":{"message":"litellm.ContextWindowExceededError: ContextWindowExceededError: OpenAIException - {\"error\":{\"message\":\"This model's maximum context length is 262144 tokens. However, you requested 262161 tokens.\"}}"}}"#
+        #expect(DestinationDiscovery.parseLengthFromError(tooMuchOutput) == 262_144)
+        #expect(DestinationDiscovery.parseLengthFromError(overflow) == 262_144)
+        #expect(DestinationDiscovery.parseLengthFromError(#"{"error":"bad key"}"#) == nil)
+    }
+
+    @Test("Ollama: served length comes from num_ctx, not the architecture maximum")
+    func ollamaShow() {
+        let json = """
+        {"parameters":"temperature 0.6\\nnum_ctx 32768\\nstop \\"<|im_end|>\\"",
+         "model_info":{"general.architecture":"qwen3","qwen3.context_length":262144},
+         "capabilities":["completion","tools","thinking"]}
+        """
+        let show = DestinationDiscovery.parseOllamaShow(Data(json.utf8))
+        #expect(show.numCtx == 32_768)
+        #expect(show.architectureMaximum == 262_144)
+        #expect(show.isChatModel)
+
+        let embedding = #"{"model_info":{"bert.context_length":2048},"capabilities":["embedding"]}"#
+        let embed = DestinationDiscovery.parseOllamaShow(Data(embedding.utf8))
+        #expect(embed.numCtx == nil)
+        #expect(!embed.isChatModel)
+    }
+
+    @Test("Ollama: loaded models and the length they were loaded at")
+    func ollamaPS() {
+        let json = #"{"models":[{"name":"qwen3:32b","model":"qwen3:32b","context_length":40960},{"name":"old:1b","model":"old:1b"}]}"#
+        let loaded = DestinationDiscovery.parseOllamaPS(Data(json.utf8))
+        #expect(loaded["qwen3:32b"] == .some(40_960))
+        #expect(loaded["old:1b"] == .some(nil))
+        #expect(loaded["absent"] == nil)
+    }
+
+    @Test("Never sends a request to the production triage tool")
+    func triageIsNeverProbed() async {
+        #expect(DestinationDiscovery.neverProbe.contains("triage-agent"))
+        // Returns before any network call — the base URL here would not resolve.
+        #expect(await DestinationDiscovery.measureLength(baseURL: "http://unresolvable.invalid",
+                                                         token: "x", model: "triage-agent") == nil)
+    }
+}

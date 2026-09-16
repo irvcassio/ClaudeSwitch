@@ -9,6 +9,9 @@ struct MenuContent: View {
     var body: some View {
         Group {
             currentDestination
+            Button(controller.toggleTitle) { Task { await controller.toggle() } }
+                .keyboardShortcut("t", modifiers: .command)
+                .disabled(controller.isBusy || (controller.isOnAnthropic && controller.toggleTarget == nil))
             Divider()
             destinationPicker
             Divider()
@@ -23,12 +26,25 @@ struct MenuContent: View {
     @ViewBuilder private var currentDestination: some View {
         switch controller.mode {
         case .anthropic:
-            Text("On Anthropic (your subscription)")
+            Text("CLI: Anthropic (your subscription)")
         case .profile(let profile):
-            Text("On \(profile.name)")
+            Text("CLI: \(profile.name) — \(profile.model)")
         case .unrecognised(let baseURL, let model):
-            Text("On an unsaved destination — \(model.isEmpty ? baseURL : model)")
+            Text("CLI: an unsaved destination — \(model.isEmpty ? baseURL : model)")
         }
+        Text(desktopLine)
+        if controller.isBusy {
+            Text("Checking the destination…")
+        }
+    }
+
+    private var desktopLine: String {
+        guard let desktop = controller.desktop else { return "Desktop: Claude.ai" }
+        if desktop.managedByMDM { return "Desktop: set by a management profile" }
+        if desktop.isOnGateway {
+            return "Desktop: gateway (\(desktop.models.first ?? "no model")) — at next launch"
+        }
+        return "Desktop: Claude.ai"
     }
 
     @ViewBuilder private var destinationPicker: some View {
@@ -40,31 +56,51 @@ struct MenuContent: View {
         .disabled(controller.isBusy)
 
         if controller.profiles.isEmpty {
-            Text("No gateways yet — add one in Settings")
+            Text("No destinations yet — add one in Settings")
         }
 
         ForEach(controller.profiles) { profile in
             Button {
                 Task { await controller.switchTo(profile) }
             } label: {
-                Label(profile.name,
-                      systemImage: controller.activeProfile?.id == profile.id ? "checkmark" : "server.rack")
+                Label(profile.name + (profile.switchesDesktop ? " (CLI + Desktop)" : " (CLI)"),
+                      systemImage: controller.activeProfile?.id == profile.id ? "checkmark" : symbol(for: profile.provider))
             }
             .disabled(controller.isBusy)
         }
     }
 
+    private func symbol(for provider: Provider) -> String {
+        switch provider {
+        case .lmStudio, .ollama: "desktopcomputer"
+        case .liteLLM, .custom: "server.rack"
+        }
+    }
+
     @ViewBuilder private var status: some View {
-        if let probe = controller.probe, controller.activeProfile != nil {
-            if probe.isHealthy {
-                Text(healthLine(probe))
-            } else {
-                Text("Gateway check failed")
+        if let profile = controller.activeProfile {
+            switch controller.liveness {
+            case .up?:
+                Text(healthLine(profile))
+            case .down(let reason)?:
+                Text("⚠︎ Destination unreachable — \(reason)")
+            case .degraded(let reason)?:
+                Text("⚠︎ Destination degraded — \(reason)")
+            case nil:
+                Text("Destination not checked yet")
             }
         }
 
+        if let profile = controller.activeProfile, profile.usesRelay {
+            Text("Relay: " + controller.relayStatus(for: profile))
+        }
+
+        let set = controller.environment.rows.filter { $0.status == .set }.count
+        let problems = controller.environment.rows.filter { [.mismatch, .missing, .stray].contains($0.status) }.count
+        Text("Env: \(set) key\(set == 1 ? "" : "s") set" + (problems > 0 ? ", \(problems) need attention" : ""))
+
         if !controller.shellOverrides.isEmpty {
-            Text("\(controller.shellOverrides.count) shell override\(controller.shellOverrides.count == 1 ? "" : "s") in your dotfiles")
+            Text("\(controller.shellOverrides.count) shell export\(controller.shellOverrides.count == 1 ? "" : "s") in your dotfiles")
         }
 
         if let note = controller.statusNote {
@@ -74,7 +110,7 @@ struct MenuContent: View {
             Text(error)
         }
 
-        Button("Check Now") { Task { await controller.recheck() } }
+        Button("Check Destination Now") { Task { await controller.recheck() } }
             .disabled(controller.isBusy || controller.activeProfile == nil)
     }
 
@@ -98,15 +134,13 @@ struct MenuContent: View {
             .keyboardShortcut("q", modifiers: .command)
     }
 
-    private func healthLine(_ probe: GatewayProbe.Result) -> String {
+    private func healthLine(_ profile: Profile) -> String {
         var parts = ["Healthy"]
-        if let latency = probe.latency {
-            let ms = Int(Double(latency.components.attoseconds) / 1e15)
-                + Int(latency.components.seconds) * 1000
-            parts.append("\(ms) ms")
+        if let probe = controller.probe, let latency = probe.latency {
+            parts.append("\(GatewayProbe.milliseconds(latency)) ms")
         }
-        if !probe.publishedModels.isEmpty {
-            parts.append("\(probe.publishedModels.count) models")
+        if profile.modelLength > 0 {
+            parts.append("\(profile.contextWindow.formatted()) / \(profile.modelLength.formatted()) ctx")
         }
         return parts.joined(separator: " · ")
     }

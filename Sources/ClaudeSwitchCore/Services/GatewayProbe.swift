@@ -1,156 +1,294 @@
 import Foundation
 
-/// Verifies a profile end to end before the user commits to it.
+/// Verifies a destination end to end before the user commits to it.
 ///
-/// Three checks, because they fail independently and for different reasons: `/v1/models` proves
-/// the key is valid and tells us which aliases exist; `/v1/messages` proves the Anthropic route
-/// answers; the same route with `stream: true` proves it speaks the *SSE* half of the dialect,
-/// which is the only half Claude Code ever uses. A gateway can pass the first two and still
-/// hand Claude Code nothing but blank replies.
+/// The checks fail independently and for different reasons, so each is its own step:
+///
+/// 1. **Listing** — the server answers, the key is accepted, and the chosen model exists (and,
+///    on LM Studio, is the loaded instance rather than one it would load a second copy of).
+/// 2. **Limits** — the context window plus the output ceiling fits inside what the server
+///    really enforces. Getting this wrong is what makes a long session hang.
+/// 3. **Turn** — a real non-streamed reply on `/v1/messages`.
+/// 4. **Stream** — the same route with `stream: true`, asking for the profile's *actual* output
+///    ceiling. Claude Code only ever streams, and it sends that ceiling on every turn.
+/// 5. **Tools** — the model answers with a `tool_use` block. Claude Code is a tool loop; a model
+///    that only ever writes prose cannot drive it.
+/// 6. **Request shape** — a `role: "system"` message inside `messages`, which Claude Code 2.1.200
+///    sends for any model it does not recognise when the base URL is custom. vLLM's Anthropic
+///    endpoint rejects it with a 400 that Claude Code's own fallback does not recognise, so every
+///    turn fails even though the five checks above pass.
 public enum GatewayProbe {
+    public struct Step: Identifiable, Hashable {
+        public enum State: Hashable { case passed, warned, failed, skipped }
+        public var id: String { name }
+        public let name: String
+        public var state: State
+        public var detail: String
+    }
+
     public struct Result {
         public var reachable: Bool
         public var publishedModels: [String]
         public var messagesRouteOK: Bool
         public var streamingRouteOK: Bool
+        public var toolUseOK: Bool?
+        /// Whether the server takes `role: "system"` inside `messages`. nil when not checked.
+        public var midConversationSystemOK: Bool?
+        public var serverLength: Int?
         public var latency: Duration?
         public var findings: [Warning]
+        public var steps: [Step] = []
 
-        /// Green only when a real *streamed* turn completed with well-formed events. Publishing a
-        /// name proves nothing about serving it, and a good non-streamed turn proves nothing
-        /// about the route Claude Code actually calls.
-        public var isHealthy: Bool { reachable && messagesRouteOK && streamingRouteOK }
+        public init(reachable: Bool, publishedModels: [String], messagesRouteOK: Bool,
+                    streamingRouteOK: Bool, toolUseOK: Bool? = nil, serverLength: Int? = nil,
+                    latency: Duration?, findings: [Warning]) {
+            self.reachable = reachable
+            self.publishedModels = publishedModels
+            self.messagesRouteOK = messagesRouteOK
+            self.streamingRouteOK = streamingRouteOK
+            self.toolUseOK = toolUseOK
+            self.serverLength = serverLength
+            self.latency = latency
+            self.findings = findings
+        }
+
+        /// Green only when a real *streamed* turn completed with well-formed events and nothing
+        /// blocking was found along the way. Publishing a name proves nothing about serving it,
+        /// and a good non-streamed turn proves nothing about the route Claude Code calls.
+        public var isHealthy: Bool {
+            reachable && messagesRouteOK && streamingRouteOK
+                && !findings.contains { $0.severity == .blocking }
+        }
+
+        mutating func record(_ name: String, _ state: Step.State, _ detail: String) {
+            steps.append(Step(name: name, state: state, detail: detail))
+        }
     }
 
-    public static func run(profile: Profile, authToken: String, timeout: TimeInterval = 8) async -> Result {
+    /// How long a turn may take. A thinking model on a cold server can spend a while before its
+    /// first token; eight seconds failed healthy local servers.
+    public static let turnTimeout: TimeInterval = 90
+
+    public static func run(profile: Profile, authToken: String?,
+                           timeout: TimeInterval = turnTimeout) async -> Result {
         var result = Result(reachable: false, publishedModels: [], messagesRouteOK: false,
                             streamingRouteOK: false, latency: nil, findings: [])
 
-        guard let base = URL(string: profile.baseURL) else {
+        // Turns go where Claude Code's turns will go — through the relay when it is on — so the
+        // checks prove the path that will actually be used. Discovery asks the server itself.
+        guard let base = URL(string: profile.clientBaseURL), base.host != nil else {
             result.findings.append(Warning(severity: .blocking, message: "Base URL is not a valid URL."))
             return result
         }
-        guard !authToken.isEmpty else {
+        let token = profile.effectiveToken(savedKey: authToken)
+        guard let token else {
             result.findings.append(Warning(severity: .blocking, message:
-                "No key saved for this profile. The gateway answers 401 without one."))
+                "No key saved for this destination. \(profile.provider.displayName) answers 401 without one."))
+            return result
+        }
+        guard !DestinationDiscovery.neverProbe.contains(profile.model) else {
+            result.findings.append(Warning(severity: .blocking, message:
+                "'\(profile.model)' is a production tool, not a chat model. ClaudeSwitch will not send it a request."))
             return result
         }
 
-        let session = URLSession(configuration: {
-            let config = URLSessionConfiguration.ephemeral
-            config.timeoutIntervalForRequest = timeout
-            return config
-        }())
-
-        // 1 — the alias list, straight from the gateway. config.yaml is not readable to us.
-        do {
-            var request = URLRequest(url: base.appending(path: "v1/models"))
-            request.setValue("Bearer \(authToken)", forHTTPHeaderField: "Authorization")
-            let (data, response) = try await session.data(for: request)
-            let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+        // 1 — listing
+        let listing = await DestinationDiscovery.discover(provider: profile.provider,
+                                                          baseURL: profile.baseURL, token: token)
+        result.publishedModels = listing.models.map(\.id)
+        let listingBlocked = listing.findings.filter { $0.severity == .blocking }
+        if !listingBlocked.isEmpty && listing.models.isEmpty {
+            result.findings.append(contentsOf: listingBlocked)
+            result.record("Listing", .failed, listingBlocked.map(\.message).joined(separator: " "))
+            // An unreachable server has nothing more to say; a 404 listing might still serve turns.
+            if listingBlocked.contains(where: { $0.message.hasPrefix("Cannot reach") || $0.message.hasPrefix("401") }) {
+                return result
+            }
+        } else {
             result.reachable = true
+            let aliasFindings = checkAliases(profile: profile, listing: listing)
+            result.findings.append(contentsOf: aliasFindings)
+            result.record("Listing",
+                          aliasFindings.contains { $0.severity == .blocking } ? .failed : .passed,
+                          aliasFindings.first?.message
+                              ?? "\(listing.selectableModels.count) usable model\(listing.selectableModels.count == 1 ? "" : "s"); '\(profile.model)' is among them.")
+        }
 
-            if code == 401 {
-                result.findings.append(Warning(severity: .blocking, message:
-                    "401 from the gateway — the key is missing, wrong, or expired. Keys are issued "
-                    + "with a duration."))
-                return result
+        // 2 — limits
+        let length = await DestinationDiscovery.serverLength(provider: profile.provider,
+                                                             baseURL: profile.baseURL, token: token,
+                                                             model: profile.model, listing: listing)
+        result.serverLength = length
+        if let length {
+            if let problem = LimitPlan.problem(modelLength: length, compactWindow: profile.contextWindow,
+                                               maxOutputTokens: profile.maxOutputTokens) {
+                result.findings.append(Warning(severity: .blocking, message: problem))
+                result.record("Limits", .failed, problem)
+            } else {
+                if profile.modelLength != 0, profile.modelLength != length {
+                    result.findings.append(Warning(severity: .caution, message:
+                        "The server now enforces \(length.formatted()) tokens; this profile was set up for "
+                        + "\(profile.modelLength.formatted()). The limits still fit, but re-run Discover to use it fully."))
+                }
+                result.record("Limits", .passed,
+                              "Window \(profile.contextWindow.formatted()) + output \(profile.maxOutputTokens.formatted()) "
+                              + "fits the server's \(length.formatted()).")
             }
-            guard code == 200 else {
-                result.findings.append(Warning(severity: .blocking, message:
-                    "/v1/models returned HTTP \(code)."))
-                return result
-            }
+        } else {
+            result.findings.append(Warning(severity: .caution, message:
+                "Could not read this server's context length, so the window could not be checked against it."))
+            result.record("Limits", .warned, "Server length unknown — not checked.")
+        }
 
-            result.publishedModels = parseModelIDs(data)
-            result.findings.append(contentsOf: checkAliases(profile: profile,
-                                                            published: result.publishedModels))
-        } catch {
-            result.findings.append(Warning(severity: .blocking, message:
-                "Cannot reach \(profile.baseURL): \(error.localizedDescription)"))
+        let client = HTTPClient(base: base, token: token, timeout: timeout)
+
+        // 3 — a real turn
+        let clock = ContinuousClock()
+        let start = clock.now
+        let turn = await client.post("v1/messages", json: [
+            "model": profile.model,
+            "max_tokens": min(2_048, max(profile.maxOutputTokens, 256)),
+            "messages": [["role": "user", "content": "Reply with exactly the word: ok"]],
+        ])
+        switch turn {
+        case .success(200, let data):
+            result.latency = clock.now - start
+            result.reachable = true
+            result.messagesRouteOK = true
+            let summary = summarizeMessage(data)
+            if summary.textCharacters == 0, summary.stopReason == "max_tokens" {
+                result.findings.append(Warning(severity: .caution, message:
+                    "The model spent the whole test budget thinking and wrote no reply. The route works, "
+                    + "but keep max output generous — reasoning counts towards it."))
+                result.record("Turn", .warned, "Answered, but only with thinking.")
+            } else {
+                result.record("Turn", .passed, "Answered in \(result.latency.map(milliseconds) ?? 0) ms.")
+            }
+        case .success(let code, let data):
+            let finding = turnFailure(code: code, body: data, profile: profile)
+            result.findings.append(finding)
+            result.record("Turn", .failed, finding.message)
+        case .failure(let message):
+            let finding = Warning(severity: .blocking, message: "/v1/messages failed: \(message)")
+            result.findings.append(finding)
+            result.record("Turn", .failed, finding.message)
+        }
+
+        guard result.messagesRouteOK else {
+            for step in ["Stream", "Tools", "Request shape"] {
+                result.record(step, .skipped, "Skipped — the plain turn failed.")
+            }
             return result
         }
 
-        // 2 — a real turn on the Anthropic route.
-        do {
-            var request = URLRequest(url: base.appending(path: "v1/messages"))
-            request.httpMethod = "POST"
-            request.setValue("Bearer \(authToken)", forHTTPHeaderField: "Authorization")
-            request.setValue("application/json", forHTTPHeaderField: "content-type")
-            request.httpBody = try JSONSerialization.data(withJSONObject: [
-                "model": profile.model,
-                "max_tokens": 16,
-                "messages": [["role": "user", "content": "reply with the word ok"]],
-            ])
-
-            let clock = ContinuousClock()
-            let start = clock.now
-            let (data, response) = try await session.data(for: request)
-            result.latency = clock.now - start
-            let code = (response as? HTTPURLResponse)?.statusCode ?? 0
-
-            switch code {
-            case 200:
-                result.messagesRouteOK = true
-            case 404:
-                result.findings.append(Warning(severity: .blocking, message:
-                    "404 on /v1/messages. This is vLLM or a plain OpenAI endpoint, not a gateway "
-                    + "that speaks the Anthropic API. Claude Code cannot use it."))
-            case 500:
-                result.findings.append(Warning(severity: .blocking, message:
-                    "500 on the first turn — the signature of an effort level Qwen3.8 rejects. "
-                    + "Set effort to low, medium or xhigh."))
-            case 403:
-                result.findings.append(Warning(severity: .blocking, message:
-                    "403 — your key is not scoped to '\(profile.model)'."))
-            default:
-                let body = String(data: data.prefix(240), encoding: .utf8) ?? ""
-                result.findings.append(Warning(severity: .blocking, message:
-                    "/v1/messages returned HTTP \(code). \(body)"))
+        // 4 — the same route, streamed, at the real output ceiling
+        let stream = await client.post("v1/messages", json: [
+            "model": profile.model,
+            "max_tokens": max(profile.maxOutputTokens, 1),
+            "stream": true,
+            "messages": [["role": "user", "content": "Count: one two three"]],
+        ])
+        switch stream {
+        case .success(200, let data):
+            let findings = checkSSE(String(decoding: data, as: UTF8.self), into: &result)
+            result.findings.append(contentsOf: findings)
+            let state: Step.State = !result.streamingRouteOK ? .failed : findings.isEmpty ? .passed : .warned
+            result.record("Stream", state, findings.first?.message
+                          ?? "Well-formed at max_tokens \(profile.maxOutputTokens.formatted()).")
+        case .success(let code, let data):
+            let body = String(decoding: data.prefix(300), as: UTF8.self)
+            var message = "Streamed /v1/messages returned HTTP \(code) at max_tokens "
+                + "\(profile.maxOutputTokens.formatted()), while a smaller plain turn succeeded. "
+                + "Claude Code sends this ceiling on every turn."
+            if let limit = DestinationDiscovery.parseLengthFromError(body) {
+                message += " The server's ceiling is \(limit.formatted()) — lower max output."
+            } else {
+                message += " \(body)"
             }
-        } catch {
-            result.findings.append(Warning(severity: .blocking, message:
-                "/v1/messages failed: \(error.localizedDescription)"))
+            result.findings.append(Warning(severity: .blocking, message: message))
+            result.record("Stream", .failed, message)
+        case .failure(let message):
+            let finding = Warning(severity: .blocking, message: "Streamed /v1/messages failed: \(message)")
+            result.findings.append(finding)
+            result.record("Stream", .failed, finding.message)
         }
 
-        // 3 — the same route again, streamed. Claude Code only ever streams, so a gateway that
-        // passes step 2 and fails here looks perfectly healthy and returns nothing but blanks.
-        guard result.messagesRouteOK else { return result }
-        do {
-            var request = URLRequest(url: base.appending(path: "v1/messages"))
-            request.httpMethod = "POST"
-            request.setValue("Bearer \(authToken)", forHTTPHeaderField: "Authorization")
-            request.setValue("application/json", forHTTPHeaderField: "content-type")
-            request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
-            request.httpBody = try JSONSerialization.data(withJSONObject: [
-                "model": profile.model,
-                "max_tokens": 32,
-                "stream": true,
-                "messages": [["role": "user", "content": "Count: one two three"]],
-            ])
-
-            let (data, response) = try await session.data(for: request)
-            let code = (response as? HTTPURLResponse)?.statusCode ?? 0
-            guard code == 200 else {
-                let body = String(data: data.prefix(240), encoding: .utf8) ?? ""
-                result.findings.append(Warning(severity: .blocking, message:
-                    "Streamed /v1/messages returned HTTP \(code), while the non-streamed call "
-                    + "succeeded. Claude Code only streams. \(body)"))
-                return result
+        // 5 — tool use
+        let tools = await client.post("v1/messages", json: [
+            "model": profile.model,
+            "max_tokens": min(4_096, max(profile.maxOutputTokens, 512)),
+            "tools": [[
+                "name": "get_time",
+                "description": "Returns the current time.",
+                "input_schema": ["type": "object", "properties": [String: Any]()],
+            ]],
+            "messages": [["role": "user", "content": "What time is it? Call the get_time tool."]],
+        ])
+        if case .success(200, let data) = tools {
+            let summary = summarizeMessage(data)
+            result.toolUseOK = summary.toolUses > 0
+            if summary.toolUses > 0 {
+                result.record("Tools", .passed, "Called the tool.")
+            } else {
+                let finding = Warning(severity: .caution, message:
+                    "Asked to call a tool, the model replied in prose. Claude Code works by calling tools; "
+                    + "check the server's tool-call parser for this model.")
+                result.findings.append(finding)
+                result.record("Tools", .warned, finding.message)
             }
-            result.findings.append(contentsOf:
-                checkSSE(String(data: data, encoding: .utf8) ?? "", into: &result))
-        } catch {
-            result.findings.append(Warning(severity: .blocking, message:
-                "Streamed /v1/messages failed: \(error.localizedDescription)"))
+        } else {
+            result.toolUseOK = false
+            let finding = Warning(severity: .caution, message:
+                "A request with tools attached was refused. Claude Code always attaches tools.")
+            result.findings.append(finding)
+            result.record("Tools", .warned, finding.message)
+        }
+
+        // 6 — the request shape Claude Code actually sends
+        let shaped = await client.post("v1/messages", json: [
+            "model": profile.model,
+            "max_tokens": min(2_048, max(profile.maxOutputTokens, 256)),
+            "system": "You are terse.",
+            "messages": [
+                ["role": "user", "content": "Reply with exactly the word: ok"],
+                ["role": "system", "content": "Context added mid-conversation."],
+            ],
+        ])
+        switch shaped {
+        case .success(200, _):
+            result.midConversationSystemOK = true
+            result.record("Request shape", .passed, "Accepts the system messages Claude Code places inside the conversation.")
+        case .success(let code, let data):
+            result.midConversationSystemOK = false
+            let body = String(decoding: data.prefix(600), as: UTF8.self)
+            let rejectsRole = body.contains("system") && (body.contains("role") || body.contains("literal_error"))
+            let message = rejectsRole
+                ? "The server rejects a role: \"system\" message inside messages (HTTP \(code)). Claude Code "
+                    + "sends one on every turn to a model it does not recognise, and this rejection is not one "
+                    + "its fallback detects — so every session fails with an API error even though the checks "
+                    + "above pass. Turn on the compatibility relay for this destination, or fold system "
+                    + "messages into the first user turn on the server (for vLLM's Anthropic endpoint, a "
+                    + "LiteLLM pre-call hook)."
+                : "A request carrying a mid-conversation system message returned HTTP \(code). \(body.prefix(240))"
+            result.findings.append(Warning(severity: .blocking, message: message))
+            result.record("Request shape", .failed, message)
+        case .failure(let message):
+            result.findings.append(Warning(severity: .caution, message: "Request-shape check failed: \(message)"))
+            result.record("Request shape", .warned, message)
         }
 
         return result
     }
 
+    // MARK: - Pieces
+
     /// The SSE contract Claude Code enforces: every `content_block_start` is matched by a
     /// `content_block_stop`, and the message is terminated. An unclosed block is *discarded* —
     /// usage and `stop_reason` survive the turn, the text does not.
+    ///
+    /// A terminated stream with no text is well-formed: the route works and the model spent its
+    /// budget thinking. That is worth a caution, not a refusal — refusing it is what used to turn
+    /// a healthy local server away.
     static func checkSSE(_ body: String, into result: inout Result) -> [Warning] {
         var counts: [String: Int] = [:]
         for line in body.split(separator: "\n", omittingEmptySubsequences: true)
@@ -171,20 +309,14 @@ public enum GatewayProbe {
 
         if started > stopped {
             return [Warning(severity: .blocking, message:
-                "The gateway's streaming adapter opened \(started) content block"
+                "The server's streaming adapter opened \(started) content block"
                 + (started == 1 ? "" : "s") + " and closed \(stopped). The Anthropic SSE contract "
                 + "requires one content_block_stop per content_block_start, and Claude Code "
                 + "discards any block left open — so every reply arrives blank even though the "
-                + "turn succeeds and tokens are billed. This is a gateway bug, not a setting: "
+                + "turn succeeds and tokens are billed. This is a server bug, not a setting: "
                 + "non-streaming works, and no client-side option can work around it. Fix it on "
-                + "the gateway (for LiteLLM, try the hosted_vllm/ provider prefix instead of "
+                + "the server (for LiteLLM, try the hosted_vllm/ provider prefix instead of "
                 + "openai/, then upgrade the proxy) before switching.")]
-        }
-
-        if deltas == 0 {
-            return [Warning(severity: .caution, message:
-                "The streamed turn emitted no text deltas. The stream is well-formed but the "
-                + "model produced nothing — check the effort level and max output tokens.")]
         }
 
         if counts["message_stop"] == nil {
@@ -194,48 +326,132 @@ public enum GatewayProbe {
         }
 
         result.streamingRouteOK = true
+
+        if deltas == 0 {
+            return [Warning(severity: .caution, message:
+                "The streamed turn emitted no text. The stream is well-formed, so this is the model "
+                + "spending its budget on thinking — keep max output generous.")]
+        }
         return []
     }
 
-    /// A liveness ping for the menu's status line. No key needed, so it can run on a timer.
-    public static func liveness(baseURL: String, timeout: TimeInterval = 4) async -> Bool {
-        guard let base = URL(string: baseURL) else { return false }
-        let config = URLSessionConfiguration.ephemeral
-        config.timeoutIntervalForRequest = timeout
-        var request = URLRequest(url: base.appending(path: "health/liveliness"))
-        request.httpMethod = "GET"
-        guard let (_, response) = try? await URLSession(configuration: config).data(for: request)
-        else { return false }
-        // Any answer at all means something is listening; 401 still proves reachability.
-        return (response as? HTTPURLResponse) != nil
+    struct MessageSummary: Equatable {
+        var textCharacters = 0
+        var toolUses = 0
+        var stopReason: String?
     }
 
-    private static func parseModelIDs(_ data: Data) -> [String] {
-        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let list = root["data"] as? [[String: Any]]
-        else { return [] }
-        return list.compactMap { $0["id"] as? String }.sorted()
+    static func summarizeMessage(_ data: Data) -> MessageSummary {
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return MessageSummary()
+        }
+        var summary = MessageSummary(stopReason: root["stop_reason"] as? String)
+        for block in root["content"] as? [[String: Any]] ?? [] {
+            switch block["type"] as? String {
+            case "text": summary.textCharacters += (block["text"] as? String)?.count ?? 0
+            case "tool_use": summary.toolUses += 1
+            default: break
+            }
+        }
+        return summary
     }
 
-    private static func checkAliases(profile: Profile, published: [String]) -> [Warning] {
-        guard !published.isEmpty else { return [] }
+    static func turnFailure(code: Int, body: Data, profile: Profile) -> Warning {
+        let text = String(decoding: body.prefix(400), as: UTF8.self)
+        switch code {
+        case 401:
+            return Warning(severity: .blocking, message:
+                "401 — the key is missing, wrong, or expired.")
+        case 403:
+            return Warning(severity: .blocking, message:
+                "403 — your key is not scoped to '\(profile.model)'.")
+        case 404:
+            return Warning(severity: .blocking, message:
+                "404 on /v1/messages. This server does not speak the Anthropic Messages API "
+                + (profile.provider == .ollama ? "— Ollama added it in 0.14; update Ollama." :
+                   profile.provider == .lmStudio ? "— update LM Studio." :
+                   "— it is a model server or a plain OpenAI endpoint, not an Anthropic-compatible one.")
+                + " Claude Code cannot use it.")
+        case 500 where text.localizedCaseInsensitiveContains("effort")
+            || text.localizedCaseInsensitiveContains("reasoning"):
+            return Warning(severity: .blocking, message:
+                "500 on the first turn, mentioning effort/reasoning — set effort to low, medium or xhigh.")
+        default:
+            return Warning(severity: .blocking, message: "/v1/messages returned HTTP \(code). \(text)")
+        }
+    }
+
+    static func checkAliases(profile: Profile, listing: DestinationDiscovery.Result) -> [Warning] {
+        guard !listing.models.isEmpty else { return [] }
         var out: [Warning] = []
         var seen = Set<String>()
+        let byID = Dictionary(listing.models.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
 
         for (label, id) in [("Model", profile.model), ("Haiku", profile.haikuModel),
                             ("Sonnet", profile.sonnetModel), ("Opus", profile.opusModel)] {
-            guard !published.contains(id), seen.insert(id).inserted else { continue }
-            out.append(Warning(severity: .blocking, message:
-                "\(label) model '\(id)' is not published by this gateway. Available: "
-                + published.joined(separator: ", ")))
+            guard seen.insert(id).inserted else { continue }
+            guard let model = byID[id] else {
+                out.append(Warning(severity: .blocking, message:
+                    "\(label) model '\(id)' is not served here. Available: "
+                    + listing.selectableModels.map(\.id).joined(separator: ", ")))
+                continue
+            }
+            if model.isLoaded == false {
+                out.append(Warning(severity: .blocking, message:
+                    "\(label) model '\(id)' is not loaded. Asking for it would make "
+                    + "\(profile.provider == .lmStudio ? "LM Studio" : "the server") load another copy. "
+                    + "Pick the loaded instance: " + listing.selectableModels.map(\.id).joined(separator: ", ")))
+            } else if !model.isChatModel {
+                out.append(Warning(severity: .blocking, message: "\(label) model '\(id)' is not a chat model."))
+            }
         }
-
-        if published.contains("triage-agent") {
-            out.append(Warning(severity: .caution, message:
-                "This gateway serves triage-agent — a production tool with real execution ability "
-                + "against stores. Developer keys are scoped to exclude it; do not call it."))
-        }
-
         return out
+    }
+
+    // MARK: - Liveness
+
+    public enum Liveness: Equatable {
+        case up
+        case down(String)
+        /// The server answers, but the chosen model is not ready to serve.
+        case degraded(String)
+
+        public var isUp: Bool { self == .up }
+    }
+
+    /// A cheap check for the menu's status line, safe to run on a timer. It never generates.
+    public static func liveness(profile: Profile, authToken: String?, timeout: TimeInterval = 4) async -> Liveness {
+        guard let base = URL(string: profile.baseURL), base.host != nil else { return .down("invalid base URL") }
+        let client = HTTPClient(base: base, token: profile.effectiveToken(savedKey: authToken), timeout: timeout)
+
+        switch profile.provider {
+        case .lmStudio:
+            guard case .success(200, let data) = await client.get("api/v0/models") else {
+                return await plainLiveness(client, path: "v1/models", what: "LM Studio")
+            }
+            let models = DestinationDiscovery.parseLMStudio(data)
+            guard let model = models.first(where: { $0.id == profile.model }) else {
+                return .degraded("'\(profile.model)' is not in LM Studio")
+            }
+            return model.isLoaded == false ? .degraded("'\(profile.model)' is not loaded") : .up
+        case .ollama:
+            return await plainLiveness(client, path: "api/version", what: "Ollama")
+        case .liteLLM:
+            return await plainLiveness(client, path: "health/liveliness", what: "the proxy")
+        case .custom:
+            return await plainLiveness(client, path: "v1/models", what: "the server")
+        }
+    }
+
+    private static func plainLiveness(_ client: HTTPClient, path: String, what: String) async -> Liveness {
+        switch await client.get(path) {
+        // Any HTTP answer means something is listening; 401 still proves reachability.
+        case .success: .up
+        case .failure(let message): .down("\(what) is not answering: \(message)")
+        }
+    }
+
+    public static func milliseconds(_ duration: Duration) -> Int {
+        Int(duration.components.seconds) * 1000 + Int(Double(duration.components.attoseconds) / 1e15)
     }
 }

@@ -2,33 +2,53 @@
 
 <img src="Resources/AppIcon.png" width="128" align="right" alt="ClaudeSwitch icon">
 
-A macOS menu bar utility that flips **Claude Code — both the desktop app and the CLI** — between
-the Anthropic cloud and a self-hosted model behind an OpenAI/Anthropic-compatible gateway, on
-demand. One click, no dotfile editing, no relaunching a terminal to pick up an export.
+A macOS menu bar utility that flips **Claude Code** between the Anthropic cloud and a model you
+run yourself — Qwen in **LM Studio** on this Mac, behind a **LiteLLM** proxy, or in **Ollama** —
+for both the CLI and Claude Desktop. One click (or ⌘T), no dotfile editing.
 
-Built for a LiteLLM gateway fronting a vLLM box, but the profile is fully editable — any gateway
-that speaks the Anthropic Messages API works.
+It does not just write settings. It asks the destination what it can serve, fits the limits to
+what the server really enforces, checks that the destination works the way Claude Code will use
+it, and says plainly which environment keys are in play.
 
-## Why a menu bar app and not a shell alias
+## How the two halves are moved
 
-Claude Code Desktop is a GUI app. It does not inherit your login shell, so `export
-ANTHROPIC_BASE_URL=…` in `~/.zshenv` reaches the CLI and nothing else. The one place that reaches
-both is the `env` block in `~/.claude/settings.json`, which Claude Code reads at launch and which
-takes precedence over shell exports.
-
-ClaudeSwitch owns exactly that block, and only eleven keys inside it:
+**The CLI** reads the `env` block of `~/.claude/settings.json` at launch, and that block beats
+shell exports. ClaudeSwitch owns exactly these twelve keys in it:
 
 ```
-ANTHROPIC_BASE_URL                          CLAUDE_CODE_EFFORT_LEVEL
-ANTHROPIC_AUTH_TOKEN                        CLAUDE_CODE_AUTO_COMPACT_WINDOW
-ANTHROPIC_MODEL                             CLAUDE_CODE_MAX_OUTPUT_TOKENS
-ANTHROPIC_DEFAULT_HAIKU_MODEL               CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
-ANTHROPIC_DEFAULT_SONNET_MODEL              CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY
-ANTHROPIC_DEFAULT_OPUS_MODEL
+ANTHROPIC_BASE_URL                ANTHROPIC_DEFAULT_OPUS_MODEL        CLAUDE_CODE_MAX_OUTPUT_TOKENS
+ANTHROPIC_AUTH_TOKEN              CLAUDE_CODE_EFFORT_LEVEL            CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+ANTHROPIC_MODEL                   CLAUDE_CODE_MAX_CONTEXT_TOKENS      CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY
+ANTHROPIC_DEFAULT_HAIKU_MODEL     CLAUDE_CODE_AUTO_COMPACT_WINDOW
+ANTHROPIC_DEFAULT_SONNET_MODEL
 ```
 
-Switching back to Anthropic removes those keys and, if that empties `env`, removes `env` too —
-so the file returns to exactly what it was.
+Switching back to Anthropic removes them and, if that empties `env`, removes `env` too — so the
+file returns to exactly what it was. Top-level `model` / `effortLevel`, which outrank the env
+block, are set aside and put back.
+
+**Claude Desktop** cannot be moved that way. It sets `ANTHROPIC_BASE_URL` and an empty
+`ANTHROPIC_AUTH_TOKEN` itself for every Code session it hosts, and Claude Code ignores a
+settings-file key the host already set (verified against Desktop 2.110 / Claude Code 2.1.200).
+The other keys still reach it — so while the CLI is on Qwen, desktop sessions stay on Anthropic
+with Qwen aliases in their environment, and a desktop subagent that asks for `haiku` fails.
+
+The desktop's supported route is its own third-party mode. For a destination with **Also switch
+Claude Desktop** on, ClaudeSwitch writes the same local configuration the desktop's *Developer →
+Configure Third-Party Inference… → Apply Changes* writes, under
+`~/Library/Application Support/Claude-3p/`, and sets the desktop to open on that side at its next
+launch. Switching back sets it to open on Claude.ai, takes the key off disk, and re-applies any
+configuration of your own. It never touches managed preferences, and the desktop's sign-in
+screen still offers both sides. The desktop accepts a gateway only over HTTPS or plain HTTP on
+this Mac — the relay below provides the latter for a remote proxy.
+
+**The compatibility relay.** Claude Code 2.1.200 puts `{"role": "system"}` messages *inside*
+`messages` for models it does not recognise. vLLM's `/v1/messages` — and so a LiteLLM proxy
+passing requests through to it — rejects them, and every turn fails. With the relay on,
+Claude Code talks to ClaudeSwitch on `127.0.0.1`, which folds those messages into the user turn
+(what Claude Code itself falls back to) and streams everything else through untouched. New
+LiteLLM destinations start with it on; the probe's *Request shape* check says when the server
+no longer needs it. ClaudeSwitch must be running while relayed sessions are in use.
 
 ## Install
 
@@ -96,32 +116,46 @@ on that machine:
 
 ## Using it
 
-1. **Settings… → your gateway profile.** Fill in base URL, model id, effort level, context window.
-   Paste the gateway key — it goes into the login Keychain, never into a config file.
-2. **Click the destination in the menu.** ClaudeSwitch probes the gateway *before* it writes:
-   `/v1/models` to confirm the ids you configured are actually served, `/v1/messages` to confirm
-   the gateway speaks the Anthropic dialect, then the same route with `stream: true` to confirm it
-   speaks the *SSE* half of that dialect — the only half Claude Code ever uses. The third check
-   exists because a gateway can pass the first two and still hand Claude Code nothing but blank
-   replies. A failed probe leaves `settings.json` untouched and tells you which check failed and
-   why.
-3. **Relaunch Claude.** The menu says so, and offers to relaunch the desktop app for you.
-   Claude Code reads `settings.json` at launch, so already-running CLI sessions stay on the old
-   destination until you start a new one — the menu counts them for you.
+1. **Settings… → + → the kind of server.** LM Studio and Ollama fill in their standard local
+   address and need no key (ClaudeSwitch sends a placeholder token, so your Anthropic credential
+   never goes to them). A LiteLLM proxy needs its address and your key, which goes into the
+   login Keychain.
+2. **Discover Models.** The server is asked what it can serve, and the model becomes a dropdown.
+   LM Studio reports which instance is *loaded* and at what context; only loaded instances are
+   offered, because asking for any other id loads another full copy of the weights. ClaudeSwitch
+   never loads or unloads models — whatever pins yours (Doppo Console, `lms load --identifier`)
+   decides. Ollama reports its served `num_ctx`. A LiteLLM proxy's real ceiling is **measured**:
+   an oversized request is refused before generation, and the refusal states vLLM's
+   `max_model_len`.
+3. **Limits are fitted, not guessed.** The server stops at its length for prompt *and* reply
+   together, and Claude Code asks for its output ceiling on top of a conversation near its
+   window. So the window is the server length minus the output ceiling minus a 2% margin —
+   262,144 becomes 240,518 with a 16,384 output ceiling. Setting the window to the full length is
+   what makes long sessions hang: a LiteLLM proxy answers the overflow with HTTP 500 and Claude
+   Code retries it. The editor shows the arithmetic and refuses a window that does not fit.
+4. **Test Destination** runs what a switch runs, and switching refuses a destination that fails
+   it: the listing (model served, loaded, a chat model), the limits against the server's real
+   length, a plain turn, a streamed turn **at the configured output ceiling**, a tool call, and
+   the request shape Claude Code 2.1.200 sends. A thinking model that spends a small budget
+   thinking passes with a caution rather than failing.
+5. **Switch** from the menu, or ⌘T to flip between Anthropic and the destination used last.
+   New CLI sessions pick it up; the menu counts the ones still on the old destination. Relaunch
+   Claude Desktop for it to open on the other side.
 
-The menu bar glyph tells you where you are at a glance: a cloud for Anthropic, a server rack for
-a gateway, a question mark if something else edited the `env` block behind your back.
+The menu shows where the CLI and the desktop each point, whether the active destination is up
+(checked every minute without generating — LM Studio's check also notices an unloaded model),
+the relay's state, and how many environment keys are set.
 
 ## Diagnostics
 
-The Diagnostics pane exists because of one specific failure mode. If a shell export like
-`ANTHROPIC_BASE_URL` survives in your dotfiles, then the moment ClaudeSwitch clears its managed
-keys that export becomes live again — the menu would say "Anthropic" while your CLI quietly kept
-talking to the gateway. Diagnostics scans `~/.zshenv`, `~/.zprofile`, `~/.zshrc`, `~/.bash_profile`
-and `~/.profile` for exports of any managed key and names the file and line.
-
-It also shows how many CLI sessions are running, whether the desktop app is up, and whether a
-backup exists.
+- **Environment keys.** Every key that decides where a turn goes: what the active destination
+  wants, what `settings.json` holds (keys masked), whether they match, which are CLI-only because
+  the desktop sets them itself, and any dotfile that exports the same key. A shell export matters
+  the moment you switch back to Anthropic: settings.json no longer overrides it, so the CLI would
+  quietly keep talking to the gateway while the menu says Anthropic.
+- **Claude Desktop.** Which side it opens on, whether ClaudeSwitch's configuration is applied,
+  and whether a management profile overrides it.
+- Top-level overrides, running CLI sessions, and the backup.
 
 ## Safety properties
 
@@ -150,37 +184,57 @@ warnings so you find out before you switch rather than mid-session:
 
 | Symptom | Cause |
 | --- | --- |
-| `unrecognized_model`, and the CLI refuses to run | Claude Code only accepts model ids containing `claude` or `anthropic`. A raw id like `Qwen/Qwen3.8-27B-FP8` is rejected client-side no matter what the gateway serves. Your gateway needs an alias whose name contains `claude`. |
+| Every turn: `400 … Input should be 'user' or 'assistant'` | Claude Code 2.1.200 sends `role: "system"` inside `messages`; vLLM's `/v1/messages` rejects it and Claude Code's fallback does not recognise the wording. Turn on the relay, or fold the messages on the server (a LiteLLM pre-call hook). The *Request shape* check catches it. |
+| A long session repeats the same failing turn forever | prompt + `max_tokens` passed the server's length; the proxy answers 500 and Claude Code retries. Use the fitted limits. |
+| The model is missing from `/model` | With gateway model discovery on, `/model` only lists ids containing `claude` or `anthropic`. Claude Code 2.1.200 itself runs other ids fine (verified with LM Studio's `qwen36-mlx8`). |
 | Every reply is blank, but tokens are billed and `stop_reason` looks fine | The gateway's Anthropic **streaming** adapter opens a `content_block_start` and never sends the matching `content_block_stop`. Claude Code discards an unclosed block, so the text is thrown away while the turn "succeeds". Non-streaming works, which is why the gateway looks healthy and why an OpenAI-dialect client on the same box (Doppo Console, anything on `/v1/chat/completions`) is unaffected. No client-side setting works around it: fix it on the gateway. For LiteLLM, give the model the `hosted_vllm/` provider prefix instead of `openai/`, then upgrade the proxy. ClaudeSwitch's third probe check refuses to switch into this. |
-| HTTP 404 on the first turn | You pointed at vLLM directly. vLLM has no `/v1/messages`; that route is the gateway's job. |
+| HTTP 404 on the first turn | The server has no Anthropic-compatible `/v1/messages` — an old LM Studio or Ollama, or an OpenAI-only endpoint. |
 | HTTP 500 on the first turn | Effort level. Qwen3.8 rejects `high` and `max`; use `low`, `medium` or `xhigh`. |
 | HTTP 403 naming models you didn't ask for | Your key is scoped to a model list that doesn't include the id you configured. |
 | No conversation titles | `ANTHROPIC_DEFAULT_HAIKU_MODEL` unmapped, so Claude Code asks the gateway for `haiku`. |
-| Context truncated early | `CLAUDE_CODE_AUTO_COMPACT_WINDOW` unset. Claude Code guesses for ids it doesn't know; pin it to the real window. |
+| Context compacts at 200K no matter what | For an id not starting with `claude-`, Claude Code takes its window from `CLAUDE_CODE_MAX_CONTEXT_TOKENS` (default 200,000) and caps `CLAUDE_CODE_AUTO_COMPACT_WINDOW` at it. ClaudeSwitch writes both. |
+| Desktop still answers as Claude after a switch | Expected unless the destination has *Also switch Claude Desktop* on — the desktop ignores the base URL and key in settings.json. |
 
-ClaudeSwitch refuses outright on the ones that are unambiguous (a `:8001` vLLM port, a trailing
-`/v1` on the base URL, an id the gateway doesn't serve) and warns on the ones that are judgment
-calls (plain-HTTP gateway, an unsafe effort level, an id the `/model` picker will hide).
+ClaudeSwitch refuses outright on the ones that are unambiguous (a trailing `/v1`, an id the
+server doesn't serve or hasn't loaded, a window that overflows the server, a rejected request
+shape, a plain-HTTP network gateway for the desktop) and warns on judgment calls (a proxy
+profile on a local server's port, plain HTTP with a key, an unsafe Qwen3.8 effort level).
 
 ## Layout
 
 ```
-Sources/ClaudeSwitchCore/     testable core, no UI
-  Model/JSONValue.swift       order-preserving JSON codec
-  Model/Profile.swift         profile + validation warnings
-  Services/                   settings store, gateway probe, keychain, diagnostics
-Sources/ClaudeSwitch/         SwiftUI MenuBarExtra app (LSUIElement, no Dock icon)
-Sources/ClaudeSwitchUpdates/  Sparkle updater service + the Updates settings pane
-Tests/ClaudeSwitchCoreTests/  swift-testing; the codec is the most heavily tested part
-VERSION                       visible version per channel — the source of truth
-scripts/build-dmg.sh          test → build → bundle → sign → notarize → DMG → publish
-scripts/version-plan.sh       per-channel version arithmetic (--selftest)
-scripts/preflight-signing.sh  proves the identity can sign before a build spends a number
+Sources/ClaudeSwitchCore/        testable core, no UI
+  Model/JSONValue.swift          order-preserving JSON codec
+  Model/Profile.swift            destination + validation warnings
+  Model/Provider.swift           LM Studio / LiteLLM / Ollama / custom
+  Model/LimitPlan.swift          fitting the window and output ceiling to the server
+  Services/DestinationDiscovery  what a server serves, and its real length
+  Services/GatewayProbe          the checks a switch runs; liveness
+  Services/CompatibilityRelay    the loopback relay
+  Services/DesktopGatewayStore   Claude Desktop's third-party configuration
+  Services/EnvironmentReport     which keys are set, where, and what they reach
+  Services/…                     settings store, keychain, diagnostics
+Sources/ClaudeSwitch/            SwiftUI MenuBarExtra app (LSUIElement, no Dock icon)
+Sources/ClaudeSwitchUpdates/     Sparkle updater service + the Updates settings pane
+Tests/ClaudeSwitchCoreTests/     swift-testing
+VERSION                          visible version per channel — the source of truth
+scripts/build-dmg.sh             test → build → bundle → sign → notarize → DMG → publish
+scripts/version-plan.sh          per-channel version arithmetic (--selftest)
+scripts/preflight-signing.sh     proves the identity can sign before a build spends a number
 ```
 
 ```bash
 swift test
+# against real servers: LM Studio at its standard address, and a LiteLLM proxy if given
+CLAUDESWITCH_LIVE=1 \
+CLAUDESWITCH_LIVE_LITELLM_URL=http://proxy.example:4000 \
+CLAUDESWITCH_LIVE_LITELLM_KEY=sk-… CLAUDESWITCH_LIVE_LITELLM_MODEL=qwen38-claude \
+swift test --filter "Live destinations"
 ```
+
+The live tests run discovery and the full probe, prove a window set to the server's full length
+is caught, and run the real `claude` binary against a throwaway config written by the same
+store a switch uses — directly and through the relay.
 
 ## License
 
