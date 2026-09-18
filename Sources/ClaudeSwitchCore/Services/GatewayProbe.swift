@@ -313,10 +313,12 @@ public enum GatewayProbe {
                 + (started == 1 ? "" : "s") + " and closed \(stopped). The Anthropic SSE contract "
                 + "requires one content_block_stop per content_block_start, and Claude Code "
                 + "discards any block left open — so every reply arrives blank even though the "
-                + "turn succeeds and tokens are billed. This is a server bug, not a setting: "
-                + "non-streaming works, and no client-side option can work around it. Fix it on "
-                + "the server (for LiteLLM, try the hosted_vllm/ provider prefix instead of "
-                + "openai/, then upgrade the proxy) before switching.")]
+                + "turn succeeds and tokens are billed. No client-side option works around it. "
+                + "Usually the gateway is translating /v1/messages into some other API instead of "
+                + "passing it through to a backend that speaks Anthropic natively. Check whether "
+                + "the gateway publishes a model id that is configured for passthrough — in "
+                + "LiteLLM that is supported_endpoints including \"/v1/messages\" on the alias — "
+                + "and select that id rather than the backend's raw model name.")]
         }
 
         if counts["message_stop"] == nil {
