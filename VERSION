@@ -29,5 +29,5 @@
 #               never copied off that machine — so keypair generation and
 #               every --publish happen on the build machine only.
 #
-STABLE=1.0.3
-BETA=1.0.3
+STABLE=1.0.4
+BETA=1.0.4
