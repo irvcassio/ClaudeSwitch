@@ -254,76 +254,327 @@ final class FakeRunner: TLSTrust.CommandRunner, @unchecked Sendable {
     }
 }
 
-/// Installs into a temporary directory, never the real Application Support folder — otherwise a
-/// CA the person running the tests had already trusted would change the results.
-/// `.serialized` because the storage root is process-wide.
-@Suite("TLS trust: installing and undoing", .serialized)
-struct TLSTrustInstallOutcomeTests {
-    init() {
-        TLSTrust.storageRoot = URL(filePath: NSTemporaryDirectory())
-            .appending(path: "ClaudeSwitchTests-\(UUID().uuidString)", directoryHint: .isDirectory)
+/// Both of these suites move `TLSTrust.storageRoot`, which is process-wide, so they are nested
+/// inside one `.serialized` suite: `.serialized` orders a suite's own tests and its sub-suites,
+/// and without the nesting the two would run in parallel and each would be building its bundle
+/// in the other's directory.
+@Suite("TLS trust: anchors on disk", .serialized)
+struct TLSTrustStorageTests {
+    /// Installs into a temporary directory, never the real Application Support folder — otherwise a
+    /// CA the person running the tests had already trusted would change the results.
+    /// `.serialized` because the storage root is process-wide.
+    @Suite("installing and undoing", .serialized)
+    struct InstallingAndUndoing {
+        init() {
+            TLSTrust.storageRoot = URL(filePath: NSTemporaryDirectory())
+                .appending(path: "ClaudeSwitchTests-\(UUID().uuidString)", directoryHint: .isDirectory)
+            // Same reason as the storage root: the real resolver reads the tester's own
+            // settings.json, and a corporate NODE_EXTRA_CA_CERTS there would put extra
+            // certificates in the bundle these tests count.
+            TLSTrust.foreignBundlePathResolver = { nil }
+        }
+
+        @Test("PEM round-trips back to the same certificate, wrapped at 64 columns")
+        func pemRoundTrip() throws {
+            let der = try #require(TLSTrust.parseCertificates(from: Data(TrustFixtures.ca.utf8)).first)
+            let pem = TLSTrust.pem(from: der)
+            #expect(TLSTrust.parseCertificates(from: Data(pem.utf8)) == [der])
+            let body = pem.components(separatedBy: "\n").filter { !$0.hasPrefix("-----") }
+            #expect(body.allSatisfy { $0.count <= 64 })
+        }
+
+        @Test("A declined authorisation prompt still leaves Claude Code working, and says so")
+        func keychainDeclined() throws {
+            let runner = FakeRunner(status: 1)
+            let der = try #require(TLSTrust.parseCertificates(from: Data(TrustFixtures.ca.utf8)).first)
+            let outcome = try TLSTrust.install(anchor: der, runner: runner)
+            defer { try? TLSTrust.remove(fingerprint: outcome.fingerprint, runner: FakeRunner()) }
+
+            // The half that needs no authorisation happened anyway — that is the point of the order.
+            #expect(outcome.cliReady)
+            #expect(!outcome.keychainTrusted)
+            #expect(!outcome.isComplete)
+            #expect(outcome.keychainMessage?.contains("Claude Code will still work") == true)
+        }
+
+        @Test("A successful install files the anchor, builds the bundle, and trusts it once")
+        func installSucceeds() throws {
+            let runner = FakeRunner()
+            let der = try #require(TLSTrust.parseCertificates(from: Data(TrustFixtures.ca.utf8)).first)
+            let outcome = try TLSTrust.install(anchor: der, runner: runner)
+
+            #expect(outcome.isComplete)
+            #expect(TLSTrust.hasAnchor(fingerprint: outcome.fingerprint))
+            #expect(FileManager.default.fileExists(
+                atPath: TLSTrust.bundlePath.path(percentEncoded: false)))
+            // Exactly one keychain command, and it is the narrowly scoped one.
+            #expect(runner.commands.count == 1)
+            #expect(runner.commands.first?.contains("add-trusted-cert") == true)
+            #expect(runner.commands.first?.contains("-d") == false)
+
+            // Undo leaves nothing behind, so NODE_EXTRA_CA_CERTS never points at a missing file.
+            let remover = FakeRunner()
+            _ = try TLSTrust.remove(fingerprint: outcome.fingerprint, runner: remover)
+            #expect(!TLSTrust.hasAnchor(fingerprint: outcome.fingerprint))
+            #expect(remover.commands.first?.contains("remove-trusted-cert") == true)
+            #expect(!FileManager.default.fileExists(
+                atPath: TLSTrust.bundlePath.path(percentEncoded: false)))
+        }
+
+        @Test("Trusting the same CA twice stores it once")
+        func installIsIdempotent() throws {
+            let der = try #require(TLSTrust.parseCertificates(from: Data(TrustFixtures.ca.utf8)).first)
+            let first = try TLSTrust.install(anchor: der, runner: FakeRunner())
+            _ = try TLSTrust.install(anchor: der, runner: FakeRunner())
+            defer { try? TLSTrust.remove(fingerprint: first.fingerprint, runner: FakeRunner()) }
+
+            let files = try FileManager.default.contentsOfDirectory(
+                at: TLSTrust.anchorDirectory, includingPropertiesForKeys: nil)
+            #expect(files.filter { $0.pathExtension == "crt" }.count == 1)
+            #expect(TLSTrust.parseCertificates(
+                from: try Data(contentsOf: TLSTrust.bundlePath)).count == 1)
+        }
     }
 
-    @Test("PEM round-trips back to the same certificate, wrapped at 64 columns")
-    func pemRoundTrip() throws {
-        let der = try #require(TLSTrust.parseCertificates(from: Data(TrustFixtures.ca.utf8)).first)
-        let pem = TLSTrust.pem(from: der)
-        #expect(TLSTrust.parseCertificates(from: Data(pem.utf8)) == [der])
-        let body = pem.components(separatedBy: "\n").filter { !$0.hasPrefix("-----") }
-        #expect(body.allSatisfy { $0.count <= 64 })
+
+    /// A `NODE_EXTRA_CA_CERTS` that belongs to somebody else. Node reads exactly one path, so on a
+    /// Mac behind a TLS-inspecting proxy the corporate bundle and this app's bundle are competing for
+    /// one variable — and the corporate one was there first. Measured 2026-09-18 from a corporate Mac:
+    /// the corporate bundle alone cannot reach the gateway, our anchor alone cannot reach
+    /// `api.anthropic.com`, and the two concatenated reach both. So merging is the only configuration
+    /// that works, not a compromise.
+    ///
+    /// `.serialized` because the storage root and the resolver are both process-wide.
+    @Suite("a CA bundle this app did not write", .serialized)
+    struct ForeignBundle {
+        let root: URL
+
+        init() {
+            root = URL(filePath: NSTemporaryDirectory())
+                .appending(path: "ClaudeSwitchForeign-\(UUID().uuidString)", directoryHint: .isDirectory)
+            TLSTrust.storageRoot = root
+            TLSTrust.foreignBundlePathResolver = { nil }
+        }
+
+        /// A file holding `contents`, under this test's own directory.
+        private func write(_ contents: String, named name: String) throws -> String {
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            let url = root.appending(path: name)
+            try Data(contents.utf8).write(to: url, options: .atomic)
+            return url.path(percentEncoded: false)
+        }
+
+        private func settingsFile(_ json: String) throws -> ClaudeSettingsStore {
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            let url = root.appending(path: "settings-\(UUID().uuidString).json")
+            try Data(json.utf8).write(to: url, options: .atomic)
+            return ClaudeSettingsStore(url: url)
+        }
+
+        private func gatewayProfile() -> Profile {
+            var profile = Profile.blank()
+            profile.baseURL = "https://gateway.test:4443"
+            profile.model = "m"
+            profile.caAnchorFingerprint = TLSTrustFingerprintTests.fingerprint
+            return profile
+        }
+
+        @Test("The foreign bundle's certificates land in bundle.pem alongside the gateway's anchor")
+        func mergesIntoTheBundle() throws {
+            let foreign = try write(TrustFixtures.unrelatedCA, named: "corporate.pem")
+            TLSTrust.foreignBundlePathResolver = { foreign }
+
+            let der = try #require(TLSTrust.parseCertificates(from: Data(TrustFixtures.ca.utf8)).first)
+            let outcome = try TLSTrust.install(anchor: der, runner: FakeRunner())
+            defer { try? TLSTrust.remove(fingerprint: outcome.fingerprint, runner: FakeRunner()) }
+
+            let bundle = try Data(contentsOf: TLSTrust.bundlePath)
+            let fingerprints = Set(TLSTrust.parseCertificates(from: bundle).map(TLSTrust.fingerprint))
+            let corporate = try #require(
+                TLSTrust.parseCertificates(from: Data(TrustFixtures.unrelatedCA.utf8)).first)
+
+            // Both, in one file — which is the whole point: Node takes one path.
+            #expect(fingerprints.contains(TLSTrust.fingerprint(der)))
+            #expect(fingerprints.contains(TLSTrust.fingerprint(corporate)))
+            #expect(fingerprints.count == 2)
+        }
+
+        @Test("A CA in both the foreign bundle and the anchors appears once")
+        func deduplicatesByFingerprint() throws {
+            let foreign = try write(TrustFixtures.ca + "\n" + TrustFixtures.unrelatedCA,
+                                    named: "overlapping.pem")
+            TLSTrust.foreignBundlePathResolver = { foreign }
+
+            let der = try #require(TLSTrust.parseCertificates(from: Data(TrustFixtures.ca.utf8)).first)
+            let outcome = try TLSTrust.install(anchor: der, runner: FakeRunner())
+            defer { try? TLSTrust.remove(fingerprint: outcome.fingerprint, runner: FakeRunner()) }
+
+            let certs = TLSTrust.parseCertificates(from: try Data(contentsOf: TLSTrust.bundlePath))
+            #expect(certs.count == 2)
+            #expect(certs.filter { TLSTrust.fingerprint($0) == TLSTrust.fingerprint(der) }.count == 1)
+        }
+
+        @Test("A foreign path that is not there does not fail the switch, and says why")
+        func missingFileIsADiagnosticNotAFailure() throws {
+            let missing = root.appending(path: "never-written.pem").path(percentEncoded: false)
+            TLSTrust.foreignBundlePathResolver = { missing }
+
+            let der = try #require(TLSTrust.parseCertificates(from: Data(TrustFixtures.ca.utf8)).first)
+            // The install is what a switch depends on; a stale path must not throw out of it.
+            let outcome = try TLSTrust.install(anchor: der, runner: FakeRunner())
+            defer { try? TLSTrust.remove(fingerprint: outcome.fingerprint, runner: FakeRunner()) }
+            #expect(outcome.cliReady)
+
+            let certs = TLSTrust.parseCertificates(from: try Data(contentsOf: TLSTrust.bundlePath))
+            #expect(certs.count == 1)
+
+            let report = try #require(TLSTrust.foreignBundle())
+            #expect(!report.isUsable)
+            #expect(report.problem?.contains("No file at") == true)
+        }
+
+        @Test("A file that is not certificates is skipped rather than corrupting the bundle")
+        func notACertificate() throws {
+            let junk = try write("this is not a certificate\n", named: "notes.txt")
+            TLSTrust.foreignBundlePathResolver = { junk }
+
+            let der = try #require(TLSTrust.parseCertificates(from: Data(TrustFixtures.ca.utf8)).first)
+            let outcome = try TLSTrust.install(anchor: der, runner: FakeRunner())
+            defer { try? TLSTrust.remove(fingerprint: outcome.fingerprint, runner: FakeRunner()) }
+
+            let bundle = try String(contentsOf: TLSTrust.bundlePath, encoding: .utf8)
+            #expect(!bundle.contains("not a certificate"))
+            #expect(TLSTrust.parseCertificates(from: Data(bundle.utf8)).count == 1)
+            #expect(TLSTrust.foreignBundle()?.problem?.contains("no certificates") == true)
+        }
+
+        @Test("Our own bundle path is not a foreign value, so it is never merged into itself")
+        func selfReferenceIsNotForeign() throws {
+            let ours = TLSTrust.bundlePath.path(percentEncoded: false)
+            let store = try settingsFile("{\"env\":{\"NODE_EXTRA_CA_CERTS\":\"\(ours)\"}}")
+
+            #expect(try store.readForeignCABundlePath() == nil)
+            try store.apply(profile: gatewayProfile(), authToken: "t")
+            #expect(store.loadForeignCAStash() == nil)
+            #expect(!FileManager.default.fileExists(atPath: store.foreignCAStashURL.path))
+
+            // And on the way back the key goes, as it always did — there was nothing to keep.
+            try store.clearManagedEnvironment()
+            #expect(try store.readManagedEnvironment()["NODE_EXTRA_CA_CERTS"] == nil)
+        }
+
+        @Test("A tilde and a relative path both resolve to a real absolute path")
+        func pathExpansion() {
+            let home = URL.homeDirectory.path(percentEncoded: false)
+            #expect(TLSTrust.resolvePath("~/ca.pem").hasPrefix(home))
+            #expect(TLSTrust.resolvePath("~/ca.pem").hasSuffix("/ca.pem"))
+            #expect(TLSTrust.resolvePath("certs/ca.pem").hasPrefix(home))
+            #expect(TLSTrust.resolvePath("/etc/ssl/ca.pem") == "/etc/ssl/ca.pem")
+        }
+
+        @Test("A gateway round trip gives the user's value back, in the position it was found")
+        func roundTripRestoresInPlace() throws {
+            let foreign = try write(TrustFixtures.unrelatedCA, named: "corporate.pem")
+            let store = try settingsFile("""
+            {"env":{"FIRST":"a","NODE_EXTRA_CA_CERTS":"\(foreign)","LAST":"z"}}
+            """)
+
+            try store.apply(profile: gatewayProfile(), authToken: "t")
+            // While the gateway is active the key is ours, and the user's value is parked.
+            #expect(try store.readManagedEnvironment()["NODE_EXTRA_CA_CERTS"]
+                    == TLSTrust.bundlePath.path(percentEncoded: false))
+            #expect(store.loadForeignCAStash()?.path == foreign)
+            #expect(store.loadForeignCAStash()?.index == 1)
+
+            try store.clearManagedEnvironment()
+            let text = try String(contentsOf: store.url, encoding: .utf8)
+            let env = try #require(JSONValue.parse(text)["env"]?.objectEntries)
+            #expect(env.map(\.key) == ["FIRST", "NODE_EXTRA_CA_CERTS", "LAST"])
+            #expect(env[1].value.stringValue == foreign)
+            // The record is consumed, so a later switch stashes afresh rather than replaying this one.
+            #expect(!FileManager.default.fileExists(atPath: store.foreignCAStashURL.path))
+        }
+
+        @Test("A second switch keeps the first stash, which is the true before state")
+        func secondSwitchDoesNotOverwriteTheStash() throws {
+            let foreign = try write(TrustFixtures.unrelatedCA, named: "corporate.pem")
+            let store = try settingsFile("""
+            {"env":{"NODE_EXTRA_CA_CERTS":"\(foreign)"}}
+            """)
+
+            try store.apply(profile: gatewayProfile(), authToken: "t")
+            // settings.json now holds our path; switching again must not record that as theirs.
+            try store.apply(profile: gatewayProfile(), authToken: "t")
+            #expect(store.loadForeignCAStash()?.path == foreign)
+
+            try store.clearManagedEnvironment()
+            #expect(try store.readUnmanagedEnvironment().isEmpty)
+            let restored = try #require(JSONValue.parse(
+                try String(contentsOf: store.url, encoding: .utf8))["env"]?.objectEntries)
+            #expect(restored.first { $0.key == "NODE_EXTRA_CA_CERTS" }?.value.stringValue == foreign)
+        }
+
+        @Test("A user with no bundle of their own sees exactly the old behaviour")
+        func noForeignValueIsUnchanged() throws {
+            let store = try settingsFile(#"{"env":{"MY_OWN":"keep"}}"#)
+
+            try store.apply(profile: gatewayProfile(), authToken: "t")
+            #expect(store.loadForeignCAStash() == nil)
+
+            try store.clearManagedEnvironment()
+            let root = try #require(JSONValue.parse(try String(contentsOf: store.url, encoding: .utf8))
+                .objectEntries)
+            let env = try #require(root.first { $0.key == "env" }?.value.objectEntries)
+            // The key is gone, and nothing was invented in its place.
+            #expect(env.map(\.key) == ["MY_OWN"])
+        }
+
+        @Test("A value set only in the shell or by launchctl is still found, and still merged")
+        func processEnvironmentIsADetectionSource() throws {
+            let foreign = try write(TrustFixtures.unrelatedCA, named: "corporate.pem")
+            // settings.json says nothing; the variable reaches this process from launchd.
+            let store = try settingsFile(#"{"env":{}}"#)
+            #expect(try store.readForeignCABundlePath() == nil)
+            #expect(store.foreignCABundlePath() == nil)
+
+            // The process environment is read through the same filter the settings value is.
+            #expect(ClaudeSettingsStore.foreignValue(foreign) == foreign)
+            #expect(ClaudeSettingsStore.foreignValue(
+                TLSTrust.bundlePath.path(percentEncoded: false)) == nil)
+            #expect(ClaudeSettingsStore.foreignValue("   ") == nil)
+            #expect(ClaudeSettingsStore.foreignValue(nil) == nil)
+
+            // A detection source only: nothing in settings.json means nothing to restore there.
+            TLSTrust.foreignBundlePathResolver = { foreign }
+            let der = try #require(TLSTrust.parseCertificates(from: Data(TrustFixtures.ca.utf8)).first)
+            let outcome = try TLSTrust.install(anchor: der, runner: FakeRunner())
+            defer { try? TLSTrust.remove(fingerprint: outcome.fingerprint, runner: FakeRunner()) }
+            #expect(TLSTrust.parseCertificates(
+                from: try Data(contentsOf: TLSTrust.bundlePath)).count == 2)
+
+            try store.apply(profile: gatewayProfile(), authToken: "t")
+            #expect(store.loadForeignCAStash() == nil)
+        }
+
+        @Test("With no anchor of our own there is no bundle, merge or not")
+        func noAnchorMeansNoBundle() throws {
+            let foreign = try write(TrustFixtures.unrelatedCA, named: "corporate.pem")
+            #expect(TLSTrust.bundleContents(from: [:], mergingForeignBundleAt: foreign).isEmpty)
+        }
+
+        @Test("Diagnostics carry the foreign bundle, so a kept CA is visible rather than assumed")
+        func environmentReportSurfacesIt() throws {
+            let foreign = try write(TrustFixtures.unrelatedCA, named: "corporate.pem")
+            let report = EnvironmentReport.build(
+                profile: gatewayProfile(), token: "t", managed: [:], unmanaged: [:], shell: [],
+                foreignCABundle: TLSTrust.inspectForeignBundle(path: foreign))
+            let bundle = try #require(report.foreignCABundle)
+            #expect(bundle.configuredPath == foreign)
+            #expect(bundle.certificateCount == 1)
+            #expect(bundle.isUsable)
+        }
     }
 
-    @Test("A declined authorisation prompt still leaves Claude Code working, and says so")
-    func keychainDeclined() throws {
-        let runner = FakeRunner(status: 1)
-        let der = try #require(TLSTrust.parseCertificates(from: Data(TrustFixtures.ca.utf8)).first)
-        let outcome = try TLSTrust.install(anchor: der, runner: runner)
-        defer { try? TLSTrust.remove(fingerprint: outcome.fingerprint, runner: FakeRunner()) }
-
-        // The half that needs no authorisation happened anyway — that is the point of the order.
-        #expect(outcome.cliReady)
-        #expect(!outcome.keychainTrusted)
-        #expect(!outcome.isComplete)
-        #expect(outcome.keychainMessage?.contains("Claude Code will still work") == true)
-    }
-
-    @Test("A successful install files the anchor, builds the bundle, and trusts it once")
-    func installSucceeds() throws {
-        let runner = FakeRunner()
-        let der = try #require(TLSTrust.parseCertificates(from: Data(TrustFixtures.ca.utf8)).first)
-        let outcome = try TLSTrust.install(anchor: der, runner: runner)
-
-        #expect(outcome.isComplete)
-        #expect(TLSTrust.hasAnchor(fingerprint: outcome.fingerprint))
-        #expect(FileManager.default.fileExists(
-            atPath: TLSTrust.bundlePath.path(percentEncoded: false)))
-        // Exactly one keychain command, and it is the narrowly scoped one.
-        #expect(runner.commands.count == 1)
-        #expect(runner.commands.first?.contains("add-trusted-cert") == true)
-        #expect(runner.commands.first?.contains("-d") == false)
-
-        // Undo leaves nothing behind, so NODE_EXTRA_CA_CERTS never points at a missing file.
-        let remover = FakeRunner()
-        _ = try TLSTrust.remove(fingerprint: outcome.fingerprint, runner: remover)
-        #expect(!TLSTrust.hasAnchor(fingerprint: outcome.fingerprint))
-        #expect(remover.commands.first?.contains("remove-trusted-cert") == true)
-        #expect(!FileManager.default.fileExists(
-            atPath: TLSTrust.bundlePath.path(percentEncoded: false)))
-    }
-
-    @Test("Trusting the same CA twice stores it once")
-    func installIsIdempotent() throws {
-        let der = try #require(TLSTrust.parseCertificates(from: Data(TrustFixtures.ca.utf8)).first)
-        let first = try TLSTrust.install(anchor: der, runner: FakeRunner())
-        _ = try TLSTrust.install(anchor: der, runner: FakeRunner())
-        defer { try? TLSTrust.remove(fingerprint: first.fingerprint, runner: FakeRunner()) }
-
-        let files = try FileManager.default.contentsOfDirectory(
-            at: TLSTrust.anchorDirectory, includingPropertiesForKeys: nil)
-        #expect(files.filter { $0.pathExtension == "crt" }.count == 1)
-        #expect(TLSTrust.parseCertificates(
-            from: try Data(contentsOf: TLSTrust.bundlePath)).count == 1)
-    }
 }
 
 @Suite("TLS trust: what each consumer needs")

@@ -43,7 +43,15 @@ public struct EnvironmentReport {
 
     public let rows: [Row]
 
-    public init(rows: [Row]) { self.rows = rows }
+    /// A `NODE_EXTRA_CA_CERTS` somebody else configured, and what became of it. Shown because the
+    /// `NODE_EXTRA_CA_CERTS` row reads as this app's own value while a gateway is active, which on
+    /// its own would look exactly like the value having been thrown away.
+    public let foreignCABundle: TLSTrust.ForeignBundle?
+
+    public init(rows: [Row], foreignCABundle: TLSTrust.ForeignBundle? = nil) {
+        self.rows = rows
+        self.foreignCABundle = foreignCABundle
+    }
 
     /// Keys the desktop injects into every Code session it hosts, which therefore never come
     /// from settings.json there. Read from Claude Desktop 2.110's session launcher.
@@ -60,7 +68,8 @@ public struct EnvironmentReport {
 
     public static func build(profile: Profile?, token: String?, managed: [String: String],
                              unmanaged: [String: String],
-                             shell: [Diagnostics.ShellOverride]) -> EnvironmentReport {
+                             shell: [Diagnostics.ShellOverride],
+                             foreignCABundle: TLSTrust.ForeignBundle? = nil) -> EnvironmentReport {
         let wanted = Dictionary(
             (profile?.environment(authToken: token ?? "") ?? []).map { ($0.key, $0.value) },
             uniquingKeysWith: { first, _ in first })
@@ -80,7 +89,7 @@ public struct EnvironmentReport {
                             isSecret: secret,
                             status: Row.status(expected: expected, current: current)))
         }
-        return EnvironmentReport(rows: rows)
+        return EnvironmentReport(rows: rows, foreignCABundle: foreignCABundle)
     }
 
     /// Enough to recognise a key, never enough to use one. Placeholders are not secret.

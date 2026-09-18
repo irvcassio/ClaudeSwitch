@@ -125,7 +125,8 @@ final class SwitchController {
             token: profile.flatMap { $0.effectiveToken(savedKey: KeychainStore.load(for: $0.id)) },
             managed: managed,
             unmanaged: (try? store.readUnmanagedEnvironment()) ?? [:],
-            shell: shellOverrides)
+            shell: shellOverrides,
+            foreignCABundle: TLSTrust.foreignBundle())
     }
 
     /// Whether the originals are parked, waiting to be put back on the way to Anthropic.
@@ -189,10 +190,25 @@ final class SwitchController {
             // Read them before the write, which is what removes them.
             let setAside = (try? store.readTopLevelOverrides()) ?? [:]
             try store.apply(profile: profile, authToken: token)
+            // After the write, which is what records the foreign bundle — the rebuild reads that
+            // record. A user who set NODE_EXTRA_CA_CERTS after trusting the gateway's CA would
+            // otherwise be on a bundle.pem built before their own bundle existed.
+            try? TLSTrust.rebuildBundle()
             lastProfileID = profile.id.uuidString
             liveness = .up
 
             var notes = [cliNote()]
+            if let foreign = TLSTrust.foreignBundle(), profile.caAnchorFingerprint != nil {
+                notes.append(foreign.isUsable
+                    ? "Your own NODE_EXTRA_CA_CERTS (\(foreign.configuredPath)) is kept: its "
+                        + "\(foreign.certificateCount) certificate"
+                        + (foreign.certificateCount == 1 ? " is" : "s are")
+                        + " merged into the bundle Claude Code reads, and the original value goes "
+                        + "back when you return to Anthropic."
+                    : "Your own NODE_EXTRA_CA_CERTS is remembered and will be put back, but "
+                        + "nothing could be merged from it: "
+                        + (foreign.problem ?? "it holds no certificates."))
+            }
             if !setAside.isEmpty {
                 notes.append("Set aside \(setAside.keys.sorted().joined(separator: " and "))"
                     + " from the top level of settings.json — "
@@ -216,8 +232,14 @@ final class SwitchController {
         lastError = nil
         statusNote = nil
         do {
+            // Read before the clear, which is what consumes the record.
+            let restored = store.loadForeignCAStash()
             try store.clearManagedEnvironment()
             var notes = [cliNote()]
+            if let restored {
+                notes.append("Put NODE_EXTRA_CA_CERTS back to \(restored.path) — the value you "
+                    + "had before switching.")
+            }
             if desktop?.isOnGateway == true {
                 do {
                     try desktopStore.deactivate()
@@ -452,6 +474,7 @@ final class SwitchController {
         else { return }
         do {
             try store.apply(profile: profile, authToken: token)
+            try? TLSTrust.rebuildBundle()
             let desktopNote = moveDesktop(to: profile, token: token)
             refresh()
             statusNote = "Updated the live configuration. " + cliNote() + "\n\n" + desktopNote

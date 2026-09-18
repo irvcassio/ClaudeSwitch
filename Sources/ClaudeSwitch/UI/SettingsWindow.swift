@@ -545,6 +545,11 @@ private struct DiagnosticsPane: View {
                     }
                 }
                 .textSelection(.enabled)
+
+                if let foreign = controller.environment.foreignCABundle {
+                    Divider()
+                    ForeignBundleRow(bundle: foreign)
+                }
             } header: {
                 Text("Environment keys")
             } footer: {
@@ -684,6 +689,37 @@ private struct DiagnosticsPane: View {
 }
 
 // MARK: - Shared rows
+
+/// The `NODE_EXTRA_CA_CERTS` the user configured themselves, and what became of it.
+///
+/// Worth its own row because the key's own row shows this app's bundle path while a gateway is
+/// active, and that on its own is indistinguishable from the value having been destroyed — which
+/// is exactly what this app used to do to it.
+private struct ForeignBundleRow: View {
+    let bundle: TLSTrust.ForeignBundle
+
+    private var detail: String {
+        guard bundle.isUsable else {
+            let problem = bundle.problem ?? "Nothing could be read from it."
+            return problem + " The value is still put back when you switch to Anthropic."
+        }
+        let plural = bundle.certificateCount == 1 ? "" : "s"
+        return "\(bundle.certificateCount) certificate\(plural) merged into the bundle "
+            + "NODE_EXTRA_CA_CERTS points at. This value is put back when you switch to Anthropic."
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text("Your own CA bundle").font(.caption).bold()
+            Text(bundle.configuredPath).font(.system(.caption, design: .monospaced))
+            Text(detail)
+                .font(.caption2)
+                .foregroundStyle(bundle.isUsable ? Color.secondary : Color.orange)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .textSelection(.enabled)
+    }
+}
 
 private struct WarningRow: View {
     let warning: Warning

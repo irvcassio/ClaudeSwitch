@@ -21,9 +21,14 @@ public struct ClaudeSettingsStore {
         "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
         "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",
-        // Not an ANTHROPIC_/CLAUDE_CODE_ key, but owned the same way: it is written only for a
-        // destination behind a private CA, and removed with the rest on the way back. Node reads
-        // it; the keychain it does not. See `TLSTrust`.
+        // Not an ANTHROPIC_/CLAUDE_CODE_ key, but written the same way: only for a destination
+        // behind a private CA. Node reads it; the keychain it does not. See `TLSTrust`.
+        //
+        // Managed does NOT mean ours to destroy. A user behind a TLS-inspecting corporate proxy
+        // has this pointing at their own CA bundle long before ClaudeSwitch is installed, and
+        // Node takes exactly one path — so displacing it takes `api.anthropic.com` away from
+        // them. A value this app did not write is set aside and put back, the same way `model`
+        // is, and its certificates are merged into `bundle.pem` so both CAs are trusted at once.
         "NODE_EXTRA_CA_CERTS",
     ]
 
@@ -89,6 +94,8 @@ public struct ClaudeSettingsStore {
     public func apply(profile: Profile, authToken: String) throws {
         try mutate { root in
             var env = root["env"]?.objectEntries ?? []
+            // Before the removal below, which is what would otherwise lose it.
+            try setAsideForeignCA(in: env)
             env.removeAll { Self.managedKeys.contains($0.key) }
             for pair in profile.environment(authToken: authToken) {
                 env.append((key: pair.key, value: .string(pair.value)))
@@ -98,17 +105,102 @@ public struct ClaudeSettingsStore {
         }
     }
 
-    /// Returns Claude Code to the Anthropic subscription by removing every managed key.
+    /// Returns Claude Code to the Anthropic subscription by removing every managed key — except
+    /// a `NODE_EXTRA_CA_CERTS` this app did not write, which goes back where it was found.
     /// An `env` block left empty by this is removed too, rather than leaving `"env": {}` behind.
     public func clearManagedEnvironment() throws {
+        let foreign = loadForeignCAStash()
         try mutate { root in
-            if var env = root["env"]?.objectEntries {
+            // A stash means there is something to put back, so `env` is visited even when the
+            // file has no `env` block left at all.
+            if root["env"] != nil || foreign != nil {
+                var env = root["env"]?.objectEntries ?? []
                 env.removeAll { Self.managedKeys.contains($0.key) }
+                if let foreign, !env.contains(where: { $0.key == Self.caBundleKey }) {
+                    env.insert((key: Self.caBundleKey, value: .string(foreign.path)),
+                               at: min(foreign.index, env.count))
+                }
                 root["env"] = env.isEmpty ? nil : .object(env)
             }
             try restoreTopLevelOverrides(in: &root)
         }
         try? FileManager.default.removeItem(at: overridesStashURL)
+        try? FileManager.default.removeItem(at: foreignCAStashURL)
+    }
+
+    // MARK: - A CA bundle this app did not write
+
+    /// The one `env` key that can already be doing somebody else's job when this app arrives.
+    public static let caBundleKey = "NODE_EXTRA_CA_CERTS"
+
+    /// Where a foreign `NODE_EXTRA_CA_CERTS` waits while a gateway is active. A sibling of the
+    /// backup and the overrides stash, so a user undoing everything by hand can see all three.
+    public var foreignCAStashURL: URL {
+        url.deletingLastPathComponent()
+            .appending(path: url.lastPathComponent + ".claudeswitch-foreign-ca")
+    }
+
+    /// The **path**, never the contents. When IT rotates the corporate CA and the user re-runs
+    /// whatever builds their bundle, the next rebuild has to pick the new certificates up — a
+    /// cached copy here would quietly pin them to the retired ones. `index` is where the key sat
+    /// among the `env` keys, so restoring it leaves the file as it was.
+    public struct StashedForeignCA: Codable, Hashable, Sendable {
+        public let path: String
+        public let index: Int
+    }
+
+    /// The value on disk, when it is somebody else's. `nil` when unset, empty, or this app's own
+    /// bundle — pointing `NODE_EXTRA_CA_CERTS` at `TLSTrust.bundlePath` is not a foreign value,
+    /// and treating it as one would stash our own path and then merge the bundle into itself.
+    public func readForeignCABundlePath() throws -> String? {
+        guard let root = try readRoot(), let env = root["env"]?.objectEntries else { return nil }
+        guard let entry = env.first(where: { $0.key == Self.caBundleKey }) else { return nil }
+        return Self.foreignValue(entry.value.stringValue)
+    }
+
+    /// `nil` unless `value` is a path that is not ours.
+    static func foreignValue(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        guard TLSTrust.resolvePath(trimmed) != TLSTrust.bundlePath.path(percentEncoded: false)
+        else { return nil }
+        return trimmed
+    }
+
+    /// The bundle whose certificates belong in `bundle.pem` alongside our own anchors.
+    ///
+    /// Three sources, in this order. The stash first: while a gateway is active it is the only
+    /// record of what was there, because `settings.json` now holds our path. Then the live
+    /// settings value, for the rebuild that happens before any switch. Then this process's own
+    /// environment — a corporate Mac may set the variable only in `~/.zshrc` or with
+    /// `launchctl setenv`, in which case it is absent from `settings.json` but inherited here,
+    /// since a GUI app inherits the launchd environment.
+    public func foreignCABundlePath() -> String? {
+        if let stashed = loadForeignCAStash() { return stashed.path }
+        if let live = try? readForeignCABundlePath() { return live }
+        return Self.foreignValue(ProcessInfo.processInfo.environment[Self.caBundleKey])
+    }
+
+    /// Records a foreign value before `apply` overwrites it. Reads the `env` entries as they were
+    /// on disk, so it must be called before the managed keys are removed from them.
+    private func setAsideForeignCA(in env: [(key: String, value: JSONValue)]) throws {
+        // An earlier stash is the true "before" state — the same rule as the top-level overrides.
+        // A second switch, with our own path now on disk, must not overwrite it.
+        guard loadForeignCAStash() == nil else { return }
+        guard let index = env.firstIndex(where: { $0.key == Self.caBundleKey }),
+              let path = Self.foreignValue(env[index].value.stringValue)
+        else { return }
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try encoder.encode(StashedForeignCA(path: path, index: index))
+            .write(to: foreignCAStashURL, options: .atomic)
+    }
+
+    public func loadForeignCAStash() -> StashedForeignCA? {
+        guard let data = try? Data(contentsOf: foreignCAStashURL) else { return nil }
+        return try? JSONDecoder().decode(StashedForeignCA.self, from: data)
     }
 
     // MARK: - Top-level overrides
@@ -197,6 +289,12 @@ public struct ClaudeSettingsStore {
     }
 
     /// Keeps one pristine copy from before this app ever touched the file.
+    ///
+    /// Deliberately once, ever: refreshing it would eventually overwrite the only record of what
+    /// the file looked like before this app existed. The consequence is that it is **not** a
+    /// record of the state immediately before the most recent write — a months-old backup is
+    /// working as intended, not a bug. Anything this app needs to give back later has its own
+    /// stash next to it: `overridesStashURL` and `foreignCAStashURL`.
     public var backupURL: URL {
         url.deletingLastPathComponent().appending(path: url.lastPathComponent + ".claudeswitch-backup")
     }

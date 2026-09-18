@@ -205,6 +205,8 @@ struct TrustSheet: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
+            foreignBundleNote
+
             HStack {
                 Button("Install") { Task { await install() } }
                     .buttonStyle(.borderedProminent)
@@ -223,6 +225,9 @@ struct TrustSheet: View {
             consumer("Claude Code", ok: outcome.cliReady,
                      detail: outcome.cliReady
                         ? "NODE_EXTRA_CA_CERTS will be written while this destination is active."
+                            + (TLSTrust.foreignBundle()?.isUsable == true
+                               ? " Your existing bundle is merged into it, not replaced."
+                               : "")
                         : "The certificate could not be filed.")
             consumer("Claude Desktop", ok: outcome.keychainTrusted,
                      detail: outcome.keychainTrusted
@@ -245,6 +250,36 @@ struct TrustSheet: View {
                     dismiss()
                 }
                 .buttonStyle(.borderedProminent)
+            }
+        }
+    }
+
+    /// Says what happens to a `NODE_EXTRA_CA_CERTS` the user already had.
+    ///
+    /// Node reads exactly one path, so on a Mac behind a TLS-inspecting proxy this app's bundle
+    /// and the corporate one are competing for the same variable. Silence here would read as
+    /// "your CA is about to be thrown away", which is what used to happen.
+    @ViewBuilder private var foreignBundleNote: some View {
+        if let foreign = TLSTrust.foreignBundle() {
+            if foreign.isUsable {
+                Label("You already have NODE_EXTRA_CA_CERTS set to \(foreign.configuredPath). "
+                      + "Its \(foreign.certificateCount) certificate"
+                      + (foreign.certificateCount == 1 ? "" : "s")
+                      + " will be merged with this one — both stay trusted — and the original "
+                      + "value goes back when you switch to Anthropic.",
+                      systemImage: "arrow.triangle.merge")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                Label("NODE_EXTRA_CA_CERTS is set to \(foreign.configuredPath), but "
+                      + (foreign.problem ?? "nothing could be read from it")
+                      + " Your value is still remembered and put back when you switch to "
+                      + "Anthropic.",
+                      systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }

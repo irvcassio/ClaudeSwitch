@@ -19,6 +19,24 @@ import Security
 /// and succeeded the moment `NODE_EXTRA_CA_CERTS` pointed at it. So trusting the CA in the
 /// keychain fixes the desktop and this app while leaving the CLI broken — which is why
 /// `NODE_EXTRA_CA_CERTS` is a managed key and not an afterthought.
+///
+/// Re-measured 2026-09-18 on the build machine, with the gateway's CA trusted for SSL in the login
+/// keychain, because an internal guide claimed the CLI needed nothing. It does. Node v26.3.0,
+/// against the same gateway in the same shell:
+///
+/// | Client                            | Result                             |
+/// |-----------------------------------|------------------------------------|
+/// | `node`, no env var                | `UNABLE_TO_VERIFY_LEAF_SIGNATURE`  |
+/// | `node --use-system-ca`, no env var| `UNABLE_TO_VERIFY_LEAF_SIGNATURE`  |
+/// | `node`, `NODE_EXTRA_CA_CERTS` set | HTTP 401 — the handshake completed |
+/// | macOS `curl`, no env var          | HTTP 401 — reads the keychain      |
+///
+/// `--use-system-ca` failing too is worth knowing: it consults the system trust store, not the
+/// *login* keychain this app installs into, so it is not an alternative to the variable either.
+///
+/// The variable is therefore load-bearing — and it is also the one thing a corporate TLS-inspecting
+/// proxy already needs. Node reads one path, so both CAs have to share this file. See
+/// `bundleContents(from:mergingForeignBundleAt:)` and `ClaudeSettingsStore.caBundleKey`.
 public enum TLSTrust {
     // MARK: - Types
 
@@ -378,6 +396,106 @@ public enum TLSTrust {
             .joined()
     }
 
+    /// The same bundle, plus the certificates of a bundle somebody else configured.
+    ///
+    /// Node takes one path, so a user behind a TLS-inspecting proxy and on a private gateway
+    /// needs both CAs in this one file — measured: the corporate bundle alone cannot reach the
+    /// gateway, our anchor alone cannot reach `api.anthropic.com`, and the concatenation reaches
+    /// both. The merge only happens when we have an anchor of our own: with none, `bundle.pem`
+    /// is not referenced by anything, and writing the user's certificates into a file nobody
+    /// reads would be noise.
+    public static func bundleContents(from anchors: [String: String],
+                                      mergingForeignBundleAt path: String?) -> String {
+        var text = bundleContents(from: anchors)
+        guard !text.isEmpty, let path else { return text }
+        let extra = certificates(inBundleAt: path)
+        guard !extra.isEmpty else { return text }
+
+        // By fingerprint, so a CA present in both files appears once — and so does a bundle
+        // that repeats itself.
+        var seen = Set(parseCertificates(from: Data(text.utf8)).map(fingerprint))
+        for der in extra where seen.insert(fingerprint(der)).inserted {
+            text += pem(from: der)
+        }
+        return text
+    }
+
+    // MARK: - A CA bundle this app did not write
+
+    /// How `rebuildBundle` learns about a foreign bundle. A closure so that the rebuild reads the
+    /// path fresh every time — and so a test can supply one without a settings.json anywhere near
+    /// the real one. Production reads the user's settings file.
+    public static var foreignBundlePathResolver: () -> String? = {
+        ClaudeSettingsStore.userSettings.foreignCABundlePath()
+    }
+
+    /// What became of a foreign bundle, for the trust sheet and diagnostics. A stale path is not
+    /// an error — it must never fail a profile switch — but it must not be silent either.
+    public struct ForeignBundle: Hashable, Sendable {
+        /// Exactly what `NODE_EXTRA_CA_CERTS` held, tilde and all.
+        public var configuredPath: String
+        /// The absolute path that was actually opened.
+        public var resolvedPath: String
+        public var certificateCount: Int
+        /// Why nothing was merged, in the user's terms. nil when the bundle was used.
+        public var problem: String?
+
+        public var isUsable: Bool { problem == nil && certificateCount > 0 }
+    }
+
+    /// Reads `path` and says what is in it, without throwing: every caller is on a path where a
+    /// bad value must degrade to a diagnostic rather than block a switch.
+    public static func inspectForeignBundle(path: String?) -> ForeignBundle? {
+        guard let path, !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+        let resolved = resolvePath(path)
+        var report = ForeignBundle(configuredPath: path, resolvedPath: resolved,
+                                   certificateCount: 0)
+        guard FileManager.default.fileExists(atPath: resolved) else {
+            report.problem = "No file at \(resolved) — nothing to merge. If this is a bundle you "
+                + "built from your keychain, build it again."
+            return report
+        }
+        guard let data = try? Data(contentsOf: URL(filePath: resolved)) else {
+            report.problem = "\(resolved) could not be read."
+            return report
+        }
+        let certs = parseCertificates(from: data)
+        guard !certs.isEmpty else {
+            report.problem = "\(resolved) holds no certificates this could parse, so it was "
+                + "skipped rather than merged into a bundle Node would then reject."
+            return report
+        }
+        report.certificateCount = certs.count
+        return report
+    }
+
+    /// The foreign bundle as things currently stand, or nil when there is none.
+    public static func foreignBundle() -> ForeignBundle? {
+        inspectForeignBundle(path: foreignBundlePathResolver())
+    }
+
+    /// An absolute path for a value a human typed: `~` expanded, and a relative path taken
+    /// against the home directory, which is where the bundle-building instructions put it. The
+    /// process working directory is `/` for a GUI app and would resolve to nothing useful.
+    public static func resolvePath(_ path: String) -> String {
+        let expanded = (path as NSString).expandingTildeInPath
+        guard !expanded.hasPrefix("/") else {
+            return URL(filePath: expanded).standardizedFileURL.path(percentEncoded: false)
+        }
+        return URL.homeDirectory.appending(path: expanded)
+            .standardizedFileURL.path(percentEncoded: false)
+    }
+
+    /// The certificates in a bundle on disk, or none if it is missing, unreadable, or not
+    /// certificates at all.
+    static func certificates(inBundleAt path: String) -> [Data] {
+        let resolved = resolvePath(path)
+        guard let data = try? Data(contentsOf: URL(filePath: resolved)) else { return [] }
+        return parseCertificates(from: data)
+    }
+
     // MARK: - What it does to the Mac
 
     /// Trust for SSL, in the user's own login keychain, and nothing more.
@@ -489,6 +607,9 @@ public enum TLSTrust {
 
     /// Rewrites `bundle.pem` from whatever anchors remain, and removes it entirely when none do —
     /// so `NODE_EXTRA_CA_CERTS` never points at a file that is not there.
+    ///
+    /// The foreign path is resolved here, on every rebuild, rather than being captured once: a
+    /// rotated corporate CA then arrives on its own, with no cached copy to go stale.
     public static func rebuildBundle() throws {
         let directory = anchorDirectory
         let manager = FileManager.default
@@ -499,7 +620,8 @@ public enum TLSTrust {
             guard let text = try? String(contentsOf: entry, encoding: .utf8) else { continue }
             anchors[entry.lastPathComponent] = text
         }
-        let contents = bundleContents(from: anchors)
+        let contents = bundleContents(from: anchors,
+                                      mergingForeignBundleAt: foreignBundlePathResolver())
         if contents.isEmpty {
             try? manager.removeItem(at: bundlePath)
         } else {
